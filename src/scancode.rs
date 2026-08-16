@@ -21,11 +21,125 @@ pub enum HostLayout {
 }
 
 impl HostLayout {
-    pub fn from_env() -> Self {
-        match std::env::var("INM_LAYOUT").as_deref() {
-            Ok("dvorak") => HostLayout::Dvorak,
-            _ => HostLayout::Qwerty,
+    /// Detect the layout the host is actually using, with `INM_LAYOUT` as an
+    /// override.
+    ///
+    /// This must not depend on the environment alone: launched from Finder,
+    /// the Dock, or a bare `./inm`, an env var is simply absent, and the
+    /// silent fallback to QWERTY makes every keystroke arrive as a different
+    /// letter on a Dvorak host.
+    pub fn detect() -> Self {
+        if let Ok(forced) = std::env::var("INM_LAYOUT") {
+            return match forced.to_lowercase().as_str() {
+                "dvorak" => HostLayout::Dvorak,
+                _ => HostLayout::Qwerty,
+            };
         }
+        if host_is_dvorak() {
+            HostLayout::Dvorak
+        } else {
+            HostLayout::Qwerty
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            HostLayout::Qwerty => "QWERTY",
+            HostLayout::Dvorak => "Dvorak",
+        }
+    }
+}
+
+fn probe(program: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new(program).args(args).output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+#[cfg(target_os = "macos")]
+fn host_is_dvorak() -> bool {
+    // e.g. "com.apple.keylayout.Dvorak"
+    probe(
+        "defaults",
+        &[
+            "read",
+            "com.apple.HIToolbox",
+            "AppleCurrentKeyboardLayoutInputSourceID",
+        ],
+    )
+    .is_some_and(|id| id.to_lowercase().contains("dvorak"))
+}
+
+#[cfg(target_os = "linux")]
+fn host_is_dvorak() -> bool {
+    probe("setxkbmap", &["-query"])
+        .or_else(|| probe("localectl", &["status"]))
+        .is_some_and(|query| active_group_is_dvorak(&query))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn host_is_dvorak() -> bool {
+    false
+}
+
+/// Does the *first* configured X11 group use Dvorak?
+///
+/// Both `setxkbmap -query` and `localectl status` list every configured group
+/// on one line (`layout: us,us` / `variant: ,dvorak`), but only the first is
+/// active at login. Matching "dvorak" anywhere in the output would misread the
+/// very common "US plus a Dvorak alternative" setup as a Dvorak host.
+fn active_group_is_dvorak(query: &str) -> bool {
+    let field = |name: &str| -> Option<String> {
+        query
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(key, _)| key.trim().to_lowercase().ends_with(name))
+            .map(|(_, value)| {
+                value
+                    .trim()
+                    .split(',')
+                    .next()
+                    .unwrap_or_default()
+                    .to_lowercase()
+            })
+    };
+
+    field("layout").is_some_and(|v| v.contains("dvorak"))
+        || field("variant").is_some_and(|v| v.contains("dvorak"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::active_group_is_dvorak;
+
+    #[test]
+    fn setxkbmap_dvorak_as_the_first_variant() {
+        let query = "rules:      evdev\nmodel:      pc105\nlayout:     us,us\nvariant:    dvorak,\n";
+        assert!(active_group_is_dvorak(query));
+    }
+
+    #[test]
+    fn setxkbmap_dvorak_only_as_the_secondary_group() {
+        // The layout the guest VMs use: US first, Dvorak as an alternative.
+        let query = "rules:      evdev\nmodel:      pc105\nlayout:     us,us\nvariant:    ,dvorak\n";
+        assert!(!active_group_is_dvorak(query));
+    }
+
+    #[test]
+    fn setxkbmap_plain_dvorak_layout() {
+        assert!(active_group_is_dvorak("layout:     dvorak\n"));
+    }
+
+    #[test]
+    fn localectl_shape() {
+        let status = "   System Locale: LANG=en_US.UTF-8\n       VC Keymap: n/a\n      X11 Layout: dvorak\n";
+        assert!(active_group_is_dvorak(status));
+    }
+
+    #[test]
+    fn plain_qwerty() {
+        assert!(!active_group_is_dvorak("layout:     us\nvariant:\n"));
     }
 }
 

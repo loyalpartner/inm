@@ -1377,7 +1377,11 @@ impl IncusManager {
             } else {
                 "相对移动"
             };
-            format!("{}  ·  {w}×{h}  ·  {pointer}", t.id.project)
+            format!(
+                "{}  ·  {w}×{h}  ·  {pointer}  ·  {}",
+                t.id.project,
+                self.host_layout.label()
+            )
         });
 
         div()
@@ -1508,7 +1512,7 @@ fn main() {
                         console_bounds: ConsoleBounds::default(),
                         console_focus: cx.focus_handle(),
                         filter_focus: cx.focus_handle(),
-                        host_layout: scancode::HostLayout::from_env(),
+                        host_layout: scancode::HostLayout::detect(),
                     };
                     state.refresh(window, cx);
                     state.start_auto_refresh(window, cx);

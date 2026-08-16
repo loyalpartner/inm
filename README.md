@@ -28,7 +28,9 @@ switching back is instant.
   Hold `⌘` to reveal the tab numbers.
 - **Non-QWERTY hosts** — a Dvorak host keyboard is reverse-mapped to physical
   key positions, so the guest applies its own layout instead of translating
-  twice (`INM_LAYOUT=dvorak`).
+  twice. Detected from the OS (macOS `HIToolbox`, Linux `setxkbmap`/
+  `localectl`); override with `INM_LAYOUT=dvorak|qwerty`. The active layout is
+  shown in the status bar.
 - **Ctrl+Alt+Del** — sendable from the status bar, since a Mac keyboard cannot
   type it.
 
