@@ -1,8 +1,8 @@
 # inm
 
-A native macOS manager for [Incus](https://linuxcontainers.org/incus/) virtual
-machines, with the SPICE console rendered **inside the app** — no
-`remote-viewer` window, no browser.
+A native manager for [Incus](https://linuxcontainers.org/incus/) virtual
+machines — macOS and Linux — with the SPICE console rendered **inside the
+app**, no `remote-viewer` window, no browser.
 
 ![demo](docs/demo.gif)
 
@@ -24,6 +24,10 @@ switching back is instant.
 - **Embedded console** — the guest screen is decoded by spice-gtk and painted
   directly into the window; mouse and keyboard are forwarded to the guest.
 - **Quick open** — `⌘P` to jump to any VM by name or project.
+- **Remote switching** — every remote from the `incus` CLI's own config, one
+  click away in the sidebar header. Switching drops whatever the previous
+  remote had open and starts fresh; there's no simultaneous multi-remote
+  view.
 - **Keyboard first** — `⌘1…9` switch tabs, `⌘W` close, `⌘B` toggle the sidebar.
   Hold `⌘` to reveal the tab numbers.
 - **Non-QWERTY hosts** — a Dvorak host keyboard is reverse-mapped to physical
@@ -37,12 +41,23 @@ switching back is instant.
 ## How it works
 
 ```
-incus console --type vga  ──►  SPICE unix socket  ──►  libspice-client-glib  ──►  gpui
-        (tunnel)                                          (decode)              (paint)
+Incus daemon REST API  ──►  data + control websockets  ──►  libspice-client-glib  ──►  gpui
+  (local socket or TLS)         (SPICE byte stream)             (decode)              (paint)
 ```
 
-- The tunnel comes from the `incus` CLI. Run with a trimmed `PATH` it finds no
-  local viewer, so it prints the raw socket path instead of launching one.
+- `inm` talks to the daemon directly — no `incus` CLI subprocess. A
+  `POST .../console?type=vga` (the same call `incus console --type vga` makes
+  internally) hands back a data and a control websocket secret; `inm` connects
+  those itself and proxies the data channel onto a throwaway local Unix
+  socket, since spice-client-glib only knows how to dial a filesystem path.
+  SPICE opens one connection per channel (main/display/inputs/...), not one
+  for the whole session, so this proxy keeps accepting and hands each new
+  connection its own fresh websocket.
+- Which daemon to talk to — a local Unix socket, or a remote host over TLS —
+  is resolved from the `incus` CLI's own `~/.config/incus/config.yml`,
+  including its self-signed pinned-certificate trust model
+  (`~/.config/incus/servercerts/<remote>.crt`). Run `incus remote add` first
+  to establish that trust; `inm` reuses it, it doesn't create it.
 - Protocol and image decoding are spice-gtk's — the same library
   `remote-viewer` uses.
 - All SPICE sessions share **one** GLib thread and one main loop. A
@@ -53,21 +68,35 @@ incus console --type vga  ──►  SPICE unix socket  ──►  libspice-clie
 
 ## Requirements
 
-- macOS with Homebrew
-- `brew install incus spice-gtk`
-- A configured Incus remote (`incus remote add …`); `inm` uses the CLI's own
-  configuration and credentials.
+A configured Incus remote (`incus remote add …`) — `inm` reuses the CLI's own
+`~/.config/incus` configuration and credentials; it never asks for its own.
+
+**macOS** (managing a remote Incus host — macOS has no local Incus daemon):
+
+- Homebrew, `brew install incus spice-gtk`
+
+**Linux**:
+
+- `incus` and `spice-gtk` (Arch: `pacman -S incus spice-gtk`)
+- Arch: [`inm`](https://aur.archlinux.org/packages/inm) on the AUR
 
 ## Build
+
+**macOS**:
 
 ```sh
 PKG_CONFIG_PATH=/opt/homebrew/opt/spice-gtk/lib/pkgconfig cargo build --release
 ```
 
+**Linux** (`spice-gtk`'s own `pkg-config` file is on the default search path):
+
+```sh
+cargo build --release
+```
+
 ## Status
 
-A personal tool, built for a specific fleet. The `incus` binary path is
-currently hardcoded to the Homebrew location in `src/incus.rs`.
+A personal tool, built for a specific fleet.
 
 ## License
 

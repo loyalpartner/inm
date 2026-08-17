@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/create-gh-release-action@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Publish inm to the AUR, building from source rather than shipping a
+  # prebuilt binary — see the comment at the top of PKGBUILD.template for why.
+  aur:
+    needs: create-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Render PKGBUILD with the release tarball's checksum
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"          # v0.1.0
+          VERSION="${TAG#v}"                # 0.1.0
+          URL="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${TAG}.tar.gz"
+
+          echo "fetching ${URL}"
+          curl -fsSL --retry 5 --retry-delay 5 -o source.tar.gz "${URL}"
+          SHA=$(sha256sum source.tar.gz | cut -d' ' -f1)
+
+          sed -e "s/@VERSION@/${VERSION}/g" \
+              -e "s/@SHA256@/${SHA}/" \
+              packaging/aur/PKGBUILD.template > PKGBUILD
+
+          echo "--- PKGBUILD ---"
+          cat PKGBUILD
+
+      - name: Publish to AUR
+        uses: KSXGitHub/github-actions-deploy-aur@v4.1.2
+        with:
+          pkgname: inm
+          pkgbuild: ./PKGBUILD
+          commit_username: ${{ secrets.AUR_USERNAME }}
+          commit_email: ${{ secrets.AUR_EMAIL }}
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: "Update to ${{ github.ref_name }}"
+          updpkgsums: false
