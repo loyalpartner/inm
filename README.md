@@ -24,6 +24,9 @@ switching back is instant.
 - **Embedded console** — the guest screen is decoded by spice-gtk and painted
   directly into the window; mouse and keyboard are forwarded to the guest.
 - **Quick open** — `⌘P` to jump to any VM by name or project.
+- **Right-click a VM** — open its console, start it, rename it (stopped VMs
+  only), or see details: location/cluster member, architecture, profiles,
+  CPU/memory limits, live memory usage, and per-interface IPv4 addresses.
 - **Remote switching** — every remote from the `incus` CLI's own config, one
   click away in the sidebar header. Switching drops whatever the previous
   remote had open and starts fresh; there's no simultaneous multi-remote
@@ -64,7 +67,9 @@ Incus daemon REST API  ──►  data + control websockets  ──►  libspice
   `GMainContext` can only be owned by one thread, so a thread per session
   deadlocks.
 - The UI is [gpui](https://www.gpui.rs/), Zed's GPU-accelerated framework.
-  Frames are coalesced to 60fps and hidden tabs skip conversion entirely.
+  Frames are capped at 60fps by default (each one is a fresh GPU texture
+  upload, not free) — lower it with `INM_FPS` on hardware that can't keep up.
+  Hidden tabs skip conversion entirely.
 
 ## Requirements
 
