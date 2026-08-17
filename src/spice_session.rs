@@ -328,6 +328,27 @@ fn primary_to_image(display: &DisplayChannel) -> Option<Arc<RenderImage>> {
     }
 
     let buffer = image::RgbaImage::from_raw(width as u32, height as u32, pixels)?;
+
+    // Keep the frame inside gpui's atlas tile. Anything larger than
+    // DEFAULT_ATLAS_SIZE (1024x1024) cannot share an existing atlas texture,
+    // so the renderer creates a whole new multi-megabyte GPU texture for it —
+    // and since every frame is a new RenderImage, that happens *per frame*.
+    // On Metal that is merely wasteful; on Vulkan/Mesa it stalls the main
+    // thread in wait_for_gpu and the window stops responding entirely.
+    // Downscaling costs nothing visually: the console is letterboxed into an
+    // element far smaller than this anyway.
+    const MAX_ATLAS_TILE: u32 = 1024;
+    let buffer = if buffer.width() > MAX_ATLAS_TILE || buffer.height() > MAX_ATLAS_TILE {
+        let scale = (MAX_ATLAS_TILE as f32 / buffer.width() as f32)
+            .min(MAX_ATLAS_TILE as f32 / buffer.height() as f32);
+        let target = (
+            ((buffer.width() as f32 * scale) as u32).max(1),
+            ((buffer.height() as f32 * scale) as u32).max(1),
+        );
+        image::imageops::resize(&buffer, target.0, target.1, image::imageops::FilterType::Triangle)
+    } else {
+        buffer
+    };
     Some(Arc::new(RenderImage::new(smallvec![Frame::new(buffer)])))
 }
 
