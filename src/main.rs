@@ -314,7 +314,7 @@ impl IncusManager {
         self.tabs.iter().any(|t| &t.id == id)
     }
 
-    fn close_tab(&mut self, id: &VmId, _window: &mut Window) {
+    fn close_tab(&mut self, id: &VmId) {
         if let Some(pos) = self.tabs.iter().position(|t| &t.id == id) {
             let mut tab = self.tabs.remove(pos);
             // Same reason the frame pump retires images: the atlas slot has to
@@ -410,7 +410,7 @@ impl IncusManager {
 
                         let id = id.clone();
                         let still_open = this
-                            .update_in(cx, |state, window, cx| {
+                            .update(cx, |state, cx| {
                                 let is_active = state.active.as_ref() == Some(&id);
                                 let Some(tab) = state.tabs.iter_mut().find(|t| t.id == id) else {
                                     return false;
@@ -423,7 +423,6 @@ impl IncusManager {
                                 if let Some(previous) = previous {
                                     state.retire_frame(previous);
                                 }
-                                let _ = window;
                                 // Background tabs keep decoding (that is what
                                 // keeps them warm) but must not force repaints.
                                 if is_active {
@@ -608,7 +607,7 @@ impl IncusManager {
         match keystroke.key.as_str() {
             "w" => {
                 if let Some(id) = self.active.clone() {
-                    self.close_tab(&id, window);
+                    self.close_tab(&id);
                     cx.notify();
                 }
             }
@@ -1294,8 +1293,8 @@ impl IncusManager {
                             .text_color(theme::faint())
                             .hover(|s| s.text_color(theme::danger()))
                             .child("✕")
-                            .on_click(cx.listener(move |state, _, window, cx| {
-                                state.close_tab(&id_close, window);
+                            .on_click(cx.listener(move |state, _, _, cx| {
+                                state.close_tab(&id_close);
                                 cx.notify();
                             })),
                     )

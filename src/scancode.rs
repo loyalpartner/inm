@@ -89,6 +89,10 @@ fn host_is_dvorak() -> bool {
 /// on one line (`layout: us,us` / `variant: ,dvorak`), but only the first is
 /// active at login. Matching "dvorak" anywhere in the output would misread the
 /// very common "US plus a Dvorak alternative" setup as a Dvorak host.
+///
+/// Only reachable on Linux, but compiled (and unit-tested) everywhere so the
+/// parsing cannot rot unnoticed on the platform it is developed on.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn active_group_is_dvorak(query: &str) -> bool {
     let field = |name: &str| -> Option<String> {
         query
