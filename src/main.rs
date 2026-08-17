@@ -1,4 +1,5 @@
 mod incus;
+mod incus_remote;
 mod scancode;
 mod spice_session;
 
@@ -172,7 +173,12 @@ struct IncusManager {
 impl IncusManager {
     fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         cx.spawn_in(window, async move |this, cx| {
-            let vms = cx.background_spawn(async { incus::list_vms() }).await;
+            // `incus::list_vms` dials a Unix socket via tokio, so it has to
+            // run on the tokio runtime rather than gpui's own executor.
+            let vms = spice_session::runtime()
+                .spawn(incus::list_vms())
+                .await
+                .unwrap_or_default();
             this.update(cx, |state, cx| {
                 state.set_vms(vms);
                 cx.notify();
@@ -187,7 +193,10 @@ impl IncusManager {
         cx.spawn_in(window, async move |this, cx| {
             loop {
                 cx.background_executor().timer(REFRESH_INTERVAL).await;
-                let vms = cx.background_spawn(async { incus::list_vms() }).await;
+                let vms = spice_session::runtime()
+                    .spawn(incus::list_vms())
+                    .await
+                    .unwrap_or_default();
                 let alive = this
                     .update(cx, |state, cx| {
                         state.set_vms(vms);
@@ -374,7 +383,10 @@ impl IncusManager {
 
     fn start_vm(&mut self, id: VmId, window: &mut Window, cx: &mut Context<Self>) {
         cx.spawn_in(window, async move |this, cx| {
-            let result = cx.background_spawn(async move { incus::start(&id) }).await;
+            let result = spice_session::runtime()
+                .spawn(async move { incus::start(&id).await })
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()));
             this.update_in(cx, |state, window, cx| {
                 if let Err(msg) = result {
                     state.error = Some(msg.into());

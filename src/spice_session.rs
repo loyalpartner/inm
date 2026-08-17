@@ -2,10 +2,14 @@
 //!
 //! Design notes:
 //!
-//! * The tunnel to each VM comes from `incus console --type vga`. Run with a
-//!   trimmed PATH it finds no local viewer, so instead of launching one it
-//!   prints the raw SPICE unix socket path and holds the tunnel open. We parse
-//!   that path and connect to it ourselves.
+//! * The tunnel to each VM comes from the Incus daemon's own REST API
+//!   (`crate::incus::open_console`), not the `incus` CLI: a `POST
+//!   .../console?type=vga` hands back a data and a control websocket secret,
+//!   mirroring what `incus console --type vga` does internally (see
+//!   `client/incus_instances.go`'s `ConsoleInstanceDynamic` upstream) minus
+//!   the CLI's own viewer-launch heuristics. We open the data websocket
+//!   ourselves and proxy it onto a local Unix socket we create, because
+//!   spice-client-glib's `Session` only knows how to dial a filesystem path.
 //! * GLib objects are neither `Send` nor `Sync`, and a `GMainContext` can only
 //!   be owned by one thread at a time. So *every* session shares one dedicated
 //!   thread running one main loop; sessions are created on it by request.
@@ -15,6 +19,7 @@
 //!   enter it through a plain channel polled from the loop.
 
 use futures::channel::mpsc;
+use futures::{SinkExt, StreamExt};
 use gpui::RenderImage;
 use image::Frame;
 use smallvec::smallvec;
@@ -24,15 +29,16 @@ use spice_client_glib::{
 };
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{UnixListener, UnixStream};
 use tokio::runtime::Runtime;
+use tokio::task::JoinHandle;
+use tokio_tungstenite::tungstenite::Message;
 
 /// SPICE_MOUSE_MODE_* (spice-protocol enums.h).
 const MOUSE_MODE_SERVER: i32 = 1;
@@ -43,8 +49,9 @@ const MOUSE_MODE_CLIENT: i32 = 2;
 /// each of them is far more work than the display can show, so coalesce.
 const FRAME_INTERVAL: Duration = Duration::from_millis(1000 / 60);
 
-/// Background tokio runtime used for the `incus` child process plumbing.
-/// (SPICE sessions run on the GLib thread, not here.)
+/// Background tokio runtime used for talking to the Incus daemon (HTTP,
+/// websockets, the local proxy socket). (SPICE sessions run on the GLib
+/// thread, not here.)
 pub fn runtime() -> &'static Runtime {
     static RT: OnceLock<Runtime> = OnceLock::new();
     RT.get_or_init(|| Runtime::new().expect("failed to start tokio runtime"))
@@ -79,7 +86,7 @@ pub struct ConsoleHandle {
     mouse_mode: Arc<AtomicI32>,
     /// Whether this console is the one on screen.
     visible: Arc<AtomicBool>,
-    _incus_child: Child,
+    _proxy: ConsoleProxy,
 }
 
 impl ConsoleHandle {
@@ -101,106 +108,147 @@ impl ConsoleHandle {
 
     pub fn stop(self) {
         let _ = self.input.send(InputEvent::Shutdown);
+        self._proxy.data_task.abort();
+        self._proxy.control_task.abort();
+        let socket_path = self._proxy.socket_path;
         runtime().spawn(async move {
-            let mut child = self._incus_child;
-            let _ = child.kill().await;
+            let _ = tokio::fs::remove_file(&socket_path).await;
         });
     }
 }
 
+/// The bridge between the Incus operation's websockets and the local Unix
+/// socket spice-client-glib dials into. Dropping/aborting the tasks tears the
+/// tunnel down; the socket file itself needs an explicit removal.
+struct ConsoleProxy {
+    data_task: JoinHandle<()>,
+    control_task: JoinHandle<()>,
+    socket_path: PathBuf,
+}
+
+/// A local path no other `inm` console tab is using yet. Good enough for a
+/// single-user desktop app — collisions would need the same pid to hand out
+/// the same counter value twice, which can't happen within one process.
+fn unique_socket_path() -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("inm-spice-{}-{n}.sock", std::process::id()))
+}
+
+/// Shuttle bytes between spice-client-glib's local connection and the
+/// operation's SPICE data websocket until either side closes.
+async fn pump_console_data(
+    local: UnixStream,
+    ws: tokio_tungstenite::WebSocketStream<crate::incus_remote::Connection>,
+) {
+    let (mut ws_write, mut ws_read) = ws.split();
+    let (mut local_read, mut local_write) = tokio::io::split(local);
+
+    let to_ws = async move {
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            match local_read.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if ws_write.send(Message::Binary(buf[..n].to_vec().into())).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = ws_write.close().await;
+    };
+
+    let to_local = async move {
+        while let Some(msg) = ws_read.next().await {
+            match msg {
+                Ok(Message::Binary(data)) => {
+                    if local_write.write_all(&data).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(Message::Close(_)) | Err(_) => break,
+                _ => {}
+            }
+        }
+    };
+
+    tokio::join!(to_ws, to_local);
+}
+
+/// Open a VM's SPICE console via the daemon's own REST API and proxy it onto
+/// a fresh local Unix socket, so the rest of this module can keep using
+/// spice-client-glib's path-based `Session::set_unix_path` unchanged.
 async fn spawn_incus_console(
     vm: &str,
     project: &str,
     force: bool,
-) -> Result<(Child, PathBuf), StartError> {
-    // Instance names are only unique per project, so always name the project
-    // explicitly rather than relying on the CLI's current one.
-    let mut args = vec!["console", vm, "--type", "vga", "--project", project];
-    if force {
-        args.push("--force");
-    }
+) -> Result<(ConsoleProxy, PathBuf), StartError> {
+    const ALREADY_CONNECTED: &str =
+        "This console is already connected. Force is required to take it over.";
 
-    let mut child = Command::new(crate::incus::BIN)
-        // A trimmed PATH hides spicy/remote-viewer, which makes incus print
-        // the raw socket path instead of launching its own viewer window.
-        .env("PATH", "/usr/bin:/bin")
-        .args(&args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // Tokio does not reap children on drop by default. Without this, any
-        // failure after the spawn (session refused, ready timeout, GLib thread
-        // gone) leaves an orphaned `incus console` holding the VM's console
-        // open — and the next attempt then needs --force to take it over.
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| StartError::Message(format!("无法启动 incus: {e}")))?;
+    let id = crate::incus::VmId {
+        name: vm.to_string().into(),
+        project: project.to_string().into(),
+    };
+    let op = crate::incus::open_console(&id, force).await.map_err(|e| {
+        if e == ALREADY_CONNECTED {
+            StartError::AlreadyConnected
+        } else {
+            StartError::Message(e)
+        }
+    })?;
 
-    let stdout = child.stdout.take().expect("stdout piped");
-    let stderr = child.stderr.take().expect("stderr piped");
-    let mut stdout_lines = BufReader::new(stdout).lines();
-    let mut stderr_lines = BufReader::new(stderr).lines();
+    // The control channel just needs to stay open for the daemon to consider
+    // this console attached; there is nothing to send for a VGA console (that
+    // is only used for text-console resize events), so just drain it and let
+    // it fall over silently if the daemon closes it.
+    let control_ws = crate::incus::operation_websocket(&op.id, &op.control_secret)
+        .await
+        .map_err(StartError::Message)?;
+    let control_task = runtime().spawn(async move {
+        let mut control_ws = control_ws;
+        while control_ws.next().await.is_some() {}
+    });
 
-    const MARKER: &str = "spice+unix://";
-    // incus has no machine-readable signal for this, so we match the message
-    // text. Verified against incus 7.2; if a future release rewords it, the
-    // takeover prompt silently degrades to a plain error.
-    const BUSY: &str = "already connected";
-    let deadline = tokio::time::sleep(Duration::from_secs(10));
-    tokio::pin!(deadline);
+    let socket_path = unique_socket_path();
+    let _ = std::fs::remove_file(&socket_path);
+    let listener = UnixListener::bind(&socket_path)
+        .map_err(|e| StartError::Message(format!("无法创建本地代理 socket: {e}")))?;
 
-    // A closed stream yields Ok(None) immediately and forever, so an exhausted
-    // branch has to be disabled or the select! spins at full tilt until the
-    // deadline — and then reports a timeout instead of the real failure.
-    let (mut stdout_open, mut stderr_open) = (true, true);
-    let mut last_stderr = String::new();
-
-    loop {
-        if !stdout_open && !stderr_open {
-            let _ = child.kill().await;
-            let detail = if last_stderr.is_empty() {
-                "incus console 未输出 socket 路径就退出了".to_string()
-            } else {
-                last_stderr
+    // SPICE opens one connection per channel (main, display, inputs, cursor,
+    // ...), not one connection for the whole session — so keep accepting,
+    // and give every new local connection its own fresh websocket against
+    // the same data secret. This mirrors incus's own `ConsoleInstanceDynamic`
+    // upstream, whose returned function is explicitly meant to be called
+    // once per connection.
+    let operation_id = op.id.clone();
+    let data_secret = op.data_secret.clone();
+    let socket_path_for_task = socket_path.clone();
+    let data_task = runtime().spawn(async move {
+        loop {
+            let Ok((conn, _)) = listener.accept().await else {
+                break;
             };
-            return Err(StartError::Message(detail));
+            let operation_id = operation_id.clone();
+            let data_secret = data_secret.clone();
+            tokio::spawn(async move {
+                if let Ok(ws) = crate::incus::operation_websocket(&operation_id, &data_secret).await {
+                    pump_console_data(conn, ws).await;
+                }
+            });
         }
+        let _ = tokio::fs::remove_file(&socket_path_for_task).await;
+    });
 
-        tokio::select! {
-            line = stdout_lines.next_line(), if stdout_open => {
-                match line {
-                    Ok(Some(line)) => {
-                        if let Some(idx) = line.find(MARKER) {
-                            let path = line[idx + MARKER.len()..].trim().to_string();
-                            return Ok((child, PathBuf::from(path)));
-                        }
-                    }
-                    _ => stdout_open = false,
-                }
-            }
-            line = stderr_lines.next_line(), if stderr_open => {
-                match line {
-                    Ok(Some(line)) => {
-                        if line.contains(BUSY) {
-                            let _ = child.kill().await;
-                            return Err(StartError::AlreadyConnected);
-                        }
-                        if line.to_lowercase().contains("error") {
-                            let _ = child.kill().await;
-                            return Err(StartError::Message(line));
-                        }
-                        if !line.trim().is_empty() {
-                            last_stderr = line;
-                        }
-                    }
-                    _ => stderr_open = false,
-                }
-            }
-            _ = &mut deadline => {
-                let _ = child.kill().await;
-                return Err(StartError::Message("等待 incus console 输出超时".into()));
-            }
-        }
-    }
+    Ok((
+        ConsoleProxy {
+            data_task,
+            control_task,
+            socket_path: socket_path.clone(),
+        },
+        socket_path,
+    ))
 }
 
 /// Copy the primary surface into a gpui image.
@@ -474,7 +522,7 @@ pub async fn start_console(
     project: String,
     force: bool,
 ) -> Result<(ConsoleHandle, mpsc::UnboundedReceiver<Arc<RenderImage>>), StartError> {
-    let (child, socket) = spawn_incus_console(&vm, &project, force).await?;
+    let (proxy, socket) = spawn_incus_console(&vm, &project, force).await?;
 
     let (frame_tx, frame_rx) = mpsc::unbounded();
     let (input_tx, input_rx) = std_mpsc::channel();
@@ -511,7 +559,7 @@ pub async fn start_console(
             input: input_tx,
             mouse_mode,
             visible,
-            _incus_child: child,
+            _proxy: proxy,
         },
         frame_rx,
     ))
