@@ -182,12 +182,23 @@ impl IncusManager {
         cx.spawn_in(window, async move |this, cx| {
             // `incus::list_vms` dials a Unix socket via tokio, so it has to
             // run on the tokio runtime rather than gpui's own executor.
-            let vms = spice_session::runtime()
+            let result = spice_session::runtime()
                 .spawn(incus::list_vms())
                 .await
-                .unwrap_or_default();
+                .unwrap_or_else(|e| Err(e.to_string()));
             this.update(cx, |state, cx| {
-                state.set_vms(vms);
+                match result {
+                    Ok(vms) => {
+                        state.error = None;
+                        state.set_vms(vms);
+                    }
+                    // Keep whatever list is already on screen rather than
+                    // silently blanking it on a transient failure (a flaky
+                    // remote during auto-refresh, say) — just say why it's
+                    // stale instead of leaving the list looking "empty" for
+                    // no visible reason.
+                    Err(msg) => state.error = Some(msg.into()),
+                }
                 cx.notify();
             })
             .ok();
@@ -228,13 +239,19 @@ impl IncusManager {
         cx.spawn_in(window, async move |this, cx| {
             loop {
                 cx.background_executor().timer(REFRESH_INTERVAL).await;
-                let vms = spice_session::runtime()
+                let result = spice_session::runtime()
                     .spawn(incus::list_vms())
                     .await
-                    .unwrap_or_default();
+                    .unwrap_or_else(|e| Err(e.to_string()));
                 let alive = this
                     .update(cx, |state, cx| {
-                        state.set_vms(vms);
+                        match result {
+                            Ok(vms) => {
+                                state.error = None;
+                                state.set_vms(vms);
+                            }
+                            Err(msg) => state.error = Some(msg.into()),
+                        }
                         cx.notify();
                     })
                     .is_ok();

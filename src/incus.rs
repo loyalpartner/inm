@@ -114,13 +114,10 @@ async fn wait_operation(id: &str) -> Result<(), String> {
 }
 
 /// Every virtual machine across every project, sorted by project then name.
-pub async fn list_vms() -> Vec<Vm> {
-    let Ok(envelope) = request("GET", "/1.0/instances?recursion=1&all-projects=true", None).await else {
-        return Vec::new();
-    };
-    let Ok(raws) = serde_json::from_value::<Vec<InstanceRaw>>(envelope["metadata"].clone()) else {
-        return Vec::new();
-    };
+pub async fn list_vms() -> Result<Vec<Vm>, String> {
+    let envelope = request("GET", "/1.0/instances?recursion=1&all-projects=true", None).await?;
+    let raws: Vec<InstanceRaw> =
+        serde_json::from_value(envelope["metadata"].clone()).map_err(|e| e.to_string())?;
 
     let mut vms: Vec<Vm> = raws
         .into_iter()
@@ -138,7 +135,7 @@ pub async fn list_vms() -> Vec<Vm> {
             .cmp(&b.id.project)
             .then_with(|| a.id.name.cmp(&b.id.name))
     });
-    vms
+    Ok(vms)
 }
 
 pub async fn start(id: &VmId) -> Result<(), String> {
