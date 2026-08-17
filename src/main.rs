@@ -1552,6 +1552,13 @@ impl IncusManager {
 
 impl Render for IncusManager {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // A repaint is about to happen, so whatever frame the console handed
+        // over has been consumed — let its session build the next one. This is
+        // what paces frame production to the renderer instead of to a timer.
+        if let Some(tab) = self.active_tab() {
+            tab.handle.frame_painted();
+        }
+
         div()
             .relative()
             .flex()

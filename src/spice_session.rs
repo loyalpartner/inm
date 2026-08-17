@@ -82,6 +82,8 @@ pub enum InputEvent {
 
 pub struct ConsoleHandle {
     input: std_mpsc::Sender<InputEvent>,
+    /// Set when a frame has been handed to the UI and not yet painted.
+    frame_in_flight: Arc<AtomicBool>,
     /// Live pointer mode, so the UI can tell absolute from relative.
     mouse_mode: Arc<AtomicI32>,
     /// Whether this console is the one on screen.
@@ -92,6 +94,12 @@ pub struct ConsoleHandle {
 impl ConsoleHandle {
     pub fn send_input(&self, event: InputEvent) {
         let _ = self.input.send(event);
+    }
+
+    /// Called once the UI has painted the frame it was given, releasing the
+    /// producer to build the next one.
+    pub fn frame_painted(&self) {
+        self.frame_in_flight.store(false, Ordering::Relaxed);
     }
 
     /// Background tabs stay connected but stop converting frames: a hidden
@@ -308,6 +316,7 @@ fn primary_to_image(display: &DisplayChannel) -> Option<Arc<RenderImage>> {
 /// A request to create a session, handed to the shared GLib thread.
 struct SessionRequest {
     socket: PathBuf,
+    frame_in_flight: Arc<AtomicBool>,
     mouse_mode: Arc<AtomicI32>,
     visible: Arc<AtomicBool>,
     frames: mpsc::UnboundedSender<Arc<RenderImage>>,
@@ -393,6 +402,7 @@ fn build_session(req: SessionRequest) -> Result<(), String> {
         let alive = alive.clone();
         let frames = req.frames;
         let visible = req.visible;
+        let in_flight = req.frame_in_flight;
         glib::source::timeout_add_local(FRAME_INTERVAL, move || {
             if !alive.get() {
                 return glib::ControlFlow::Break;
@@ -402,9 +412,21 @@ fn build_session(req: SessionRequest) -> Result<(), String> {
             if !visible.load(Ordering::Relaxed) {
                 return glib::ControlFlow::Continue;
             }
+            // Backpressure: never build a frame while the UI still owes us a
+            // paint for the last one. Producing at a fixed rate regardless
+            // makes the renderer allocate and upload a full-screen texture per
+            // frame; on gpui's Vulkan backend the main thread then spins in
+            // wait_for_gpu and the whole window stops responding. Waiting for
+            // the paint adapts to whatever the GPU can actually sustain —
+            // 60fps on Metal, less on a slow Vulkan path — with no magic
+            // number to tune.
+            if in_flight.load(Ordering::Relaxed) {
+                return glib::ControlFlow::Continue;
+            }
             if dirty.replace(false) {
                 if let Some(display) = display_channel.borrow().as_ref() {
                     if let Some(image) = primary_to_image(display) {
+                        in_flight.store(true, Ordering::Relaxed);
                         if frames.unbounded_send(image).is_err() {
                             alive.set(false);
                             return glib::ControlFlow::Break;
@@ -530,10 +552,12 @@ pub async fn start_console(
     let mouse_mode = Arc::new(AtomicI32::new(MOUSE_MODE_SERVER));
     // A console starts visible: it is opened because the user wants to see it.
     let visible = Arc::new(AtomicBool::new(true));
+    let frame_in_flight = Arc::new(AtomicBool::new(false));
 
     session_requests()
         .send(SessionRequest {
             socket,
+            frame_in_flight: frame_in_flight.clone(),
             mouse_mode: mouse_mode.clone(),
             visible: visible.clone(),
             frames: frame_tx,
@@ -557,6 +581,7 @@ pub async fn start_console(
     Ok((
         ConsoleHandle {
             input: input_tx,
+            frame_in_flight,
             mouse_mode,
             visible,
             _proxy: proxy,
