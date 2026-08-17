@@ -161,6 +161,13 @@ struct IncusManager {
     consumed_keys: std::collections::HashSet<String>,
     /// Tab groups (by project) the user folded away.
     collapsed_groups: Vec<SharedString>,
+    /// Open right-click menu: which instance, and where to draw it.
+    context_menu: Option<(VmId, gpui::Point<gpui::Pixels>)>,
+    /// Details dialog: the instance, and its data once it has loaded.
+    details: Option<(VmId, Option<incus::VmDetails>)>,
+    /// Rename dialog: the instance being renamed and the name being typed.
+    rename: Option<(VmId, String)>,
+    rename_focus: gpui::FocusHandle,
     /// Quick-open palette (⌘P): query plus the highlighted row.
     palette: Option<Palette>,
     palette_focus: gpui::FocusHandle,
@@ -282,6 +289,127 @@ impl IncusManager {
         for tab in &self.tabs {
             tab.handle.set_visible(self.active.as_ref() == Some(&tab.id));
         }
+    }
+
+    /// Close the topmost overlay, if any. Returns whether something closed.
+    fn dismiss_overlay(&mut self, window: &mut Window) -> bool {
+        if self.context_menu.take().is_some() {
+            return true;
+        }
+        if self.details.take().is_some() || self.rename.take().is_some() {
+            window.focus(&self.console_focus);
+            return true;
+        }
+        false
+    }
+
+    fn begin_rename(&mut self, id: VmId, window: &mut Window, cx: &mut Context<Self>) {
+        self.context_menu = None;
+        self.rename = Some((id.clone(), id.name.to_string()));
+        window.focus(&self.rename_focus);
+        cx.notify();
+    }
+
+    fn handle_rename_key(
+        &mut self,
+        keystroke: &gpui::Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((id, name)) = self.rename.as_mut() else {
+            return;
+        };
+        match keystroke.key.as_str() {
+            "escape" => {
+                self.rename = None;
+                window.focus(&self.console_focus);
+            }
+            "backspace" => {
+                name.pop();
+            }
+            "enter" => {
+                let (id, name) = (id.clone(), name.trim().to_string());
+                if name.is_empty() || name == id.name.as_ref() {
+                    self.rename = None;
+                    window.focus(&self.console_focus);
+                } else {
+                    self.commit_rename(id, name, window, cx);
+                }
+            }
+            _ => {
+                if let Some(ch) = keystroke.key_char.as_ref() {
+                    if ch.chars().all(|c| !c.is_control()) {
+                        name.push_str(ch);
+                    }
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn commit_rename(
+        &mut self,
+        id: VmId,
+        new_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.rename = None;
+        window.focus(&self.console_focus);
+        cx.notify();
+
+        cx.spawn_in(window, async move |this, cx| {
+            let (target, name) = (id.clone(), new_name.clone());
+            let result = spice_session::runtime()
+                .spawn(async move { incus::rename(&target, &name).await })
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()));
+            this.update_in(cx, |state, window, cx| {
+                if let Err(msg) = result {
+                    state.error = Some(msg.into());
+                }
+                state.refresh(window, cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn show_details(&mut self, id: VmId, window: &mut Window, cx: &mut Context<Self>) {
+        self.context_menu = None;
+        self.details = Some((id.clone(), None));
+        cx.notify();
+
+        cx.spawn_in(window, async move |this, cx| {
+            let fetch_id = id.clone();
+            let result = spice_session::runtime()
+                .spawn(async move { incus::details(&fetch_id).await })
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()));
+            this.update(cx, |state, cx| {
+                match result {
+                    // Only fill in if the dialog is still showing this VM —
+                    // the user may have closed it or opened another meanwhile.
+                    Ok(details) if state.details.as_ref().is_some_and(|(d, _)| d == &id) => {
+                        state.details = Some((id.clone(), Some(details)));
+                    }
+                    Ok(_) => {}
+                    Err(msg) => {
+                        // Same identity guard as the success arm: a slow
+                        // failure for VM A must not close the dialog the user
+                        // has since opened for VM B.
+                        if state.details.as_ref().is_some_and(|(d, _)| d == &id) {
+                            state.details = None;
+                        }
+                        state.error = Some(msg.into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Hand a frame over for delayed destruction.
@@ -755,6 +883,330 @@ impl IncusManager {
         cx.notify();
     }
 
+    fn render_context_menu(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let (id, position) = self.context_menu.clone()?;
+        let vm = self.vms.iter().find(|v| v.id == id)?.clone();
+        let running = vm.running();
+
+        let item = |label: SharedString,
+                    key: &'static str,
+                    enabled: bool,
+                    action: Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)>| {
+            div()
+                .id(SharedString::from(format!("menu-{key}")))
+                .px_3()
+                .py_1()
+                .text_sm()
+                .when(enabled, |s| {
+                    s.cursor_pointer()
+                        .text_color(theme::text())
+                        .hover(|s| s.bg(theme::selected()))
+                })
+                .when(!enabled, |s| s.text_color(theme::faint()))
+                .child(label)
+                .on_click(cx.listener(move |state, _, window, cx| {
+                    if enabled {
+                        action(state, window, cx);
+                    }
+                }))
+        };
+
+        let id_console = id.clone();
+        let id_start = id.clone();
+        let id_details = id.clone();
+        let id_rename = id.clone();
+
+        // Keep the menu on screen: anchored at the pointer it would otherwise
+        // hang off the bottom for rows near the end of a long sidebar, leaving
+        // its last items clipped and unclickable.
+        const MENU_SIZE: (f32, f32) = (170.0, 116.0);
+        let viewport = window.viewport_size();
+        let left = f32::from(position.x).min((f32::from(viewport.width) - MENU_SIZE.0).max(0.0));
+        let top = f32::from(position.y).min((f32::from(viewport.height) - MENU_SIZE.1).max(0.0));
+
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                // Swallow clicks aimed at dismissing the menu, so they do not
+                // also land on the row or console underneath.
+                .occlude()
+                .child(
+                    div()
+                        .id("context-menu")
+                        // Dismiss on a click *outside* the menu. A full-screen
+                        // catcher listening for mouse-down would eat the press
+                        // that precedes an item's click, so the item's action
+                        // would never run.
+                        .on_mouse_down_out(cx.listener(|state, _, _, cx| {
+                            state.context_menu = None;
+                            cx.notify();
+                        }))
+                        .absolute()
+                        .left(px(left))
+                        .top(px(top))
+                        .w(px(MENU_SIZE.0))
+                        .py_1()
+                        .rounded_md()
+                        .bg(theme::panel())
+                        .border_1()
+                        .border_color(theme::border())
+                        .shadow_lg()
+                        .flex()
+                        .flex_col()
+                        .child(item(
+                            "打开控制台".into(),
+                            "console",
+                            running,
+                            Box::new(move |state, window, cx| {
+                                state.context_menu = None;
+                                state.open_or_focus(id_console.clone(), window, cx);
+                            }),
+                        ))
+                        .child(item(
+                            if running { "已在运行".into() } else { "启动".into() },
+                            "start",
+                            !running,
+                            Box::new(move |state, window, cx| {
+                                state.context_menu = None;
+                                state.start_vm(id_start.clone(), window, cx);
+                            }),
+                        ))
+                        .child(
+                            div()
+                                .my_1()
+                                .h(px(1.0))
+                                .bg(theme::border()),
+                        )
+                        .child(item(
+                            if running {
+                                "重命名（需先停止）".into()
+                            } else {
+                                "重命名".into()
+                            },
+                            "rename",
+                            !running,
+                            Box::new(move |state, window, cx| {
+                                state.begin_rename(id_rename.clone(), window, cx);
+                            }),
+                        ))
+                        .child(item(
+                            "详细信息".into(),
+                            "details",
+                            true,
+                            Box::new(move |state, window, cx| {
+                                state.show_details(id_details.clone(), window, cx);
+                            }),
+                        )),
+                ),
+        )
+    }
+
+    fn render_details(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let (id, details) = self.details.as_ref()?;
+
+        let row = |label: &'static str, value: String| {
+            div()
+                .flex()
+                .flex_row()
+                .gap_3()
+                .py_0p5()
+                .child(
+                    div()
+                        .w(px(84.0))
+                        .flex_shrink_0()
+                        .text_xs()
+                        .text_color(theme::faint())
+                        .child(label),
+                )
+                .child(div().text_sm().text_color(theme::text()).child(value))
+        };
+
+        let mut body = div().flex().flex_col().px_4().py_3().gap_0p5();
+        body = body
+            .child(row("项目", id.project.to_string()))
+            .child(row("名称", id.name.to_string()));
+
+        match details {
+            None => body = body.child(row("", "加载中…".into())),
+            Some(d) => {
+                body = body
+                    .child(row("状态", d.status.clone()))
+                    // The whole point of this dialog: which cluster member is
+                    // actually running the instance.
+                    .child(row(
+                        "宿主机",
+                        match (d.location.is_empty(), &d.location_address) {
+                            (true, _) => "（非集群）".to_string(),
+                            (false, Some(addr)) => format!("{}  {addr}", d.location),
+                            (false, None) => d.location.clone(),
+                        },
+                    ))
+                    .when_some(d.location_status.clone(), |el, status| {
+                        el.child(row("节点状态", status))
+                    })
+                    .child(row("架构", d.architecture.clone()));
+
+                if let Some(cpu) = &d.cpu_limit {
+                    body = body.child(row("CPU", cpu.clone()));
+                }
+                if let Some(mem) = &d.memory_limit {
+                    let used = d
+                        .memory_usage
+                        .map(|b| format!("（已用 {:.1} GiB）", b as f64 / (1 << 30) as f64))
+                        .unwrap_or_default();
+                    body = body.child(row("内存", format!("{mem}{used}")));
+                }
+                if let Some(disk) = &d.root_disk {
+                    body = body.child(row("根盘", disk.clone()));
+                }
+                for (iface, ip) in &d.addresses {
+                    body = body.child(row("地址", format!("{ip}  ({iface})")));
+                }
+                if !d.profiles.is_empty() {
+                    body = body.child(row("profile", d.profiles.join(", ")));
+                }
+                if let Some(created) = d.created_at.split('T').next() {
+                    body = body.child(row("创建于", created.to_string()));
+                }
+            }
+        }
+
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .pt_20()
+                .occlude()
+                .child(
+                    div()
+                        .id("details-dialog")
+                        .on_mouse_down_out(cx.listener(|state, _, _, cx| {
+                            state.details = None;
+                            cx.notify();
+                        }))
+                        .w(px(420.0))
+                        .rounded_lg()
+                        .bg(theme::panel())
+                        .border_1()
+                        .border_color(theme::border())
+                        .shadow_lg()
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .justify_between()
+                                .items_center()
+                                .px_4()
+                                .py_2()
+                                .border_b_1()
+                                .border_color(theme::border())
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(theme::text())
+                                        .child("详细信息"),
+                                )
+                                .child(
+                                    div()
+                                        .id("close-details")
+                                        .cursor_pointer()
+                                        .text_xs()
+                                        .text_color(theme::faint())
+                                        .hover(|s| s.text_color(theme::text()))
+                                        .child("✕")
+                                        .on_click(cx.listener(|state, _, _, cx| {
+                                            state.details = None;
+                                            cx.notify();
+                                        })),
+                                ),
+                        )
+                        .child(body),
+                ),
+        )
+    }
+
+    fn render_rename(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let (id, name) = self.rename.clone()?;
+
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .pt_20()
+                .occlude()
+                .child(
+                    div()
+                        .id("rename-dialog")
+                        .track_focus(&self.rename_focus)
+                        .key_context("Rename")
+                        .on_key_down(cx.listener(|state, event: &gpui::KeyDownEvent, window, cx| {
+                            state.handle_rename_key(&event.keystroke, window, cx);
+                        }))
+                        .on_mouse_down_out(cx.listener(|state, _, window, cx| {
+                            state.rename = None;
+                            window.focus(&state.console_focus);
+                            cx.notify();
+                        }))
+                        .w(px(380.0))
+                        .rounded_lg()
+                        .bg(theme::panel())
+                        .border_1()
+                        .border_color(theme::border())
+                        .shadow_lg()
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .px_4()
+                                .py_2()
+                                .border_b_1()
+                                .border_color(theme::border())
+                                .text_sm()
+                                .text_color(theme::text())
+                                .child(format!("重命名 {}", id.name)),
+                        )
+                        .child(
+                            div()
+                                .m_3()
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .bg(theme::bg())
+                                .border_1()
+                                .border_color(theme::accent())
+                                .text_sm()
+                                .text_color(theme::text())
+                                .child(name),
+                        )
+                        .child(
+                            div()
+                                .px_4()
+                                .pb_3()
+                                .text_xs()
+                                .text_color(theme::faint())
+                                .child("⏎ 确认 · Esc 取消"),
+                        ),
+                ),
+        )
+    }
+
     fn render_palette(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let matches = self.palette_matches();
         let selected = self
@@ -1106,6 +1558,7 @@ impl IncusManager {
                                     let running = vm.running();
                                     let id_open = vm.id.clone();
                                     let id_start = vm.id.clone();
+                                    let id_menu = vm.id.clone();
 
                                     div()
                                         .id(element_id(&vm.id, "vm"))
@@ -1133,6 +1586,15 @@ impl IncusManager {
                                                 })
                                                 .child(vm.id.name.clone()),
                                         )
+                                        .when(!vm.location.is_empty(), |el| {
+                                            el.child(
+                                                div()
+                                                    .flex_shrink_0()
+                                                    .text_xs()
+                                                    .text_color(theme::faint())
+                                                    .child(vm.location.clone()),
+                                            )
+                                        })
                                         .when(pending, |el| {
                                             el.child(
                                                 div()
@@ -1172,10 +1634,19 @@ impl IncusManager {
                                             )
                                         })
                                         .on_click(cx.listener(move |state, _, window, cx| {
+                                            state.context_menu = None;
                                             if running {
                                                 state.open_or_focus(id_open.clone(), window, cx);
                                             }
                                         }))
+                                        .on_mouse_down(
+                                            GpuiMouseButton::Right,
+                                            cx.listener(move |state, event: &gpui::MouseDownEvent, _, cx| {
+                                                state.context_menu =
+                                                    Some((id_menu.clone(), event.position));
+                                                cx.notify();
+                                            }),
+                                        )
                                 }))
                             })
                     })),
@@ -1409,6 +1880,14 @@ impl IncusManager {
             .track_focus(&self.console_focus)
             .key_context("SpiceConsole")
             .on_key_down(cx.listener(|state, event: &gpui::KeyDownEvent, window, cx| {
+                // Escape closes whatever overlay is on top. It has to be
+                // checked here rather than in handle_shortcut, which only ever
+                // runs for Cmd-modified keys — a bare Escape would otherwise
+                // sail past and get typed into the guest instead.
+                if event.keystroke.key == "escape" && state.dismiss_overlay(window) {
+                    cx.notify();
+                    return;
+                }
                 // Anything held with Cmd belongs to the app, whether or not it
                 // maps to a shortcut. Forwarding the press but then swallowing
                 // the release (which is what happens when the guard is on the
@@ -1637,6 +2116,9 @@ impl Render for IncusManager {
             )
             .child(self.render_status_bar(cx))
             .when(self.palette.is_some(), |el| el.child(self.render_palette(cx)))
+            .children(self.render_context_menu(window, cx))
+            .children(self.render_details(cx))
+            .children(self.render_rename(cx))
             .when(self.remote_switcher_open, |el| {
                 el.child(self.render_remote_switcher(cx))
             })
@@ -1675,6 +2157,10 @@ fn main() {
                         held_modifiers: gpui::Modifiers::default(),
                         consumed_keys: std::collections::HashSet::new(),
                         collapsed_groups: Vec::new(),
+                        context_menu: None,
+                        details: None,
+                        rename: None,
+                        rename_focus: cx.focus_handle(),
                         palette: None,
                         palette_focus: cx.focus_handle(),
                         retired_frames: std::collections::VecDeque::new(),

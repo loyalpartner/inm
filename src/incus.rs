@@ -28,6 +28,10 @@ pub struct VmId {
 pub struct Vm {
     pub id: VmId,
     pub status: SharedString,
+    /// Cluster member hosting this instance; empty when the daemon is not
+    /// clustered. Shown in the sidebar so the fleet's layout is visible
+    /// without opening each instance.
+    pub location: SharedString,
 }
 
 impl Vm {
@@ -41,6 +45,8 @@ struct InstanceRaw {
     name: String,
     status: String,
     project: String,
+    #[serde(default)]
+    location: String,
     #[serde(rename = "type")]
     kind: String,
 }
@@ -128,6 +134,7 @@ pub async fn list_vms() -> Result<Vec<Vm>, String> {
                 name: v.name.into(),
             },
             status: v.status.into(),
+            location: v.location.into(),
         })
         .collect();
     vms.sort_by(|a, b| {
@@ -136,6 +143,141 @@ pub async fn list_vms() -> Result<Vec<Vm>, String> {
             .then_with(|| a.id.name.cmp(&b.id.name))
     });
     Ok(vms)
+}
+
+/// Everything the details view shows. Assembled from two endpoints: the
+/// instance itself (static configuration, including which cluster member runs
+/// it) and its runtime state (addresses, memory), which the list response
+/// deliberately omits.
+pub struct VmDetails {
+    pub status: String,
+    pub location: String,
+    /// Address of the cluster member named by `location`, so the host is
+    /// actionable (ssh, browser) and not just a label.
+    pub location_address: Option<String>,
+    /// Whether that member is Online.
+    pub location_status: Option<String>,
+    pub architecture: String,
+    pub created_at: String,
+    pub profiles: Vec<String>,
+    pub cpu_limit: Option<String>,
+    pub memory_limit: Option<String>,
+    pub root_disk: Option<String>,
+    pub memory_usage: Option<u64>,
+    /// (interface, IPv4 address) for everything that has one.
+    pub addresses: Vec<(String, String)>,
+}
+
+pub async fn details(id: &VmId) -> Result<VmDetails, String> {
+    let (name, project) = (encode(id.name.as_ref()), encode(id.project.as_ref()));
+    let instance = request(
+        "GET",
+        &format!("/1.0/instances/{name}?project={project}"),
+        None,
+    )
+    .await?;
+    let meta = &instance["metadata"];
+
+    let config = &meta["expanded_config"];
+    let text = |v: &Value| v.as_str().map(str::to_string);
+
+    // A stopped instance has no runtime state; that is not an error here, the
+    // view just shows the static half.
+    let state = request(
+        "GET",
+        &format!("/1.0/instances/{name}/state?project={project}"),
+        None,
+    )
+    .await
+    .ok();
+    let mut addresses = Vec::new();
+    let mut memory_usage = None;
+    if let Some(state) = &state {
+        let state = &state["metadata"];
+        memory_usage = state["memory"]["usage"].as_u64();
+        if let Some(networks) = state["network"].as_object() {
+            for (iface, value) in networks {
+                if iface == "lo" {
+                    continue;
+                }
+                for addr in value["addresses"].as_array().into_iter().flatten() {
+                    if addr["family"].as_str() == Some("inet") {
+                        if let Some(ip) = addr["address"].as_str() {
+                            addresses.push((iface.clone(), ip.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let location = text(&meta["location"]).unwrap_or_default();
+    let member = if location.is_empty() {
+        None
+    } else {
+        // A standalone daemon has no /1.0/cluster/members, so a failure here
+        // is expected rather than exceptional — the name alone still shows.
+        request(
+            "GET",
+            &format!("/1.0/cluster/members/{}", encode(&location)),
+            None,
+        )
+        .await
+        .ok()
+    };
+    let location_address = member.as_ref().and_then(|m| {
+        m["metadata"]["url"]
+            .as_str()
+            // The member URL is https://<host>:<port>; only the host is useful
+            // to show or to paste into ssh.
+            .and_then(|url| url.strip_prefix("https://"))
+            .map(|host| {
+                // `[fd00::1]:8443` must not be split on its own colons; only a
+                // trailing `:port` is stripped.
+                match host.strip_prefix('[').and_then(|r| r.split_once(']')) {
+                    Some((v6, _)) => v6.to_string(),
+                    None => host.rsplit_once(':').map_or(host, |(h, _)| h).to_string(),
+                }
+            })
+    });
+    let location_status = member
+        .as_ref()
+        .and_then(|m| m["metadata"]["status"].as_str().map(str::to_string));
+
+    Ok(VmDetails {
+        status: text(&meta["status"]).unwrap_or_default(),
+        location,
+        location_address,
+        location_status,
+        architecture: text(&meta["architecture"]).unwrap_or_default(),
+        created_at: text(&meta["created_at"]).unwrap_or_default(),
+        profiles: meta["profiles"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|p| p.as_str().map(str::to_string))
+            .collect(),
+        cpu_limit: text(&config["limits.cpu"]),
+        memory_limit: text(&config["limits.memory"]),
+        root_disk: text(&meta["expanded_devices"]["root"]["size"]),
+        memory_usage,
+        addresses,
+    })
+}
+
+/// Rename an instance. Incus refuses this while the instance is running, so
+/// callers should only offer it for stopped ones.
+pub async fn rename(id: &VmId, new_name: &str) -> Result<(), String> {
+    let path = format!(
+        "/1.0/instances/{}?project={}",
+        encode(id.name.as_ref()),
+        encode(id.project.as_ref())
+    );
+    let envelope = request("POST", &path, Some(serde_json::json!({ "name": new_name }))).await?;
+    let op_id = envelope["metadata"]["id"]
+        .as_str()
+        .ok_or("响应中缺少 operation id")?;
+    wait_operation(op_id).await
 }
 
 pub async fn start(id: &VmId) -> Result<(), String> {
