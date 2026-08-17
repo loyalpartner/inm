@@ -44,10 +44,28 @@ use tokio_tungstenite::tungstenite::Message;
 const MOUSE_MODE_SERVER: i32 = 1;
 const MOUSE_MODE_CLIENT: i32 = 2;
 
-/// How often a changed surface is turned into a frame. spice-gtk reports one
-/// damage event per drawing operation; converting the whole framebuffer for
-/// each of them is far more work than the display can show, so coalesce.
-const FRAME_INTERVAL: Duration = Duration::from_millis(1000 / 60);
+/// How often a changed surface is turned into a frame.
+///
+/// This is a real rate cap, not just coalescing of spice-gtk's per-draw damage
+/// events. Every new frame is a distinct `RenderImage`, so the renderer must
+/// upload a full-screen texture for it; repaints *between* frames reuse the
+/// cached one and cost nothing. Capping the swap rate is therefore the only
+/// lever on GPU work — backpressure alone does nothing, because gpui repaints
+/// on vsync regardless and would just release the producer 60 times a second.
+///
+/// 30 is what an Intel UHD 730 sustains for a 1280x800 console; a discrete GPU
+/// will not notice the difference. `INM_FPS` overrides it — hardware varies
+/// far too much for one number to be right everywhere.
+fn frame_interval() -> Duration {
+    static CACHED: OnceLock<Duration> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let fps: u64 = std::env::var("INM_FPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30);
+        Duration::from_millis(1000 / fps.clamp(1, 120))
+    })
+}
 
 /// Background tokio runtime used for talking to the Incus daemon (HTTP,
 /// websockets, the local proxy socket). (SPICE sessions run on the GLib
@@ -403,7 +421,7 @@ fn build_session(req: SessionRequest) -> Result<(), String> {
         let frames = req.frames;
         let visible = req.visible;
         let in_flight = req.frame_in_flight;
-        glib::source::timeout_add_local(FRAME_INTERVAL, move || {
+        glib::source::timeout_add_local(frame_interval(), move || {
             if !alive.get() {
                 return glib::ControlFlow::Break;
             }
