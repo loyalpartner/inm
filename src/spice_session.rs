@@ -46,23 +46,20 @@ const MOUSE_MODE_CLIENT: i32 = 2;
 
 /// How often a changed surface is turned into a frame.
 ///
-/// This is a real rate cap, not just coalescing of spice-gtk's per-draw damage
-/// events. Every new frame is a distinct `RenderImage`, so the renderer must
-/// upload a full-screen texture for it; repaints *between* frames reuse the
-/// cached one and cost nothing. Capping the swap rate is therefore the only
-/// lever on GPU work — backpressure alone does nothing, because gpui repaints
-/// on vsync regardless and would just release the producer 60 times a second.
+/// A rate cap, not just coalescing of spice-gtk's per-draw damage events:
+/// every new frame is a distinct `RenderImage`, so the renderer uploads a
+/// full-screen texture for it, while repaints *between* frames reuse the
+/// cached one for free.
 ///
-/// 30 is what an Intel UHD 730 sustains for a 1280x800 console; a discrete GPU
-/// will not notice the difference. `INM_FPS` overrides it — hardware varies
-/// far too much for one number to be right everywhere.
+/// 60 matches the display; `INM_FPS` lowers it for hardware that cannot keep
+/// up with a full-screen texture upload per frame.
 fn frame_interval() -> Duration {
     static CACHED: OnceLock<Duration> = OnceLock::new();
     *CACHED.get_or_init(|| {
         let fps: u64 = std::env::var("INM_FPS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(30);
+            .unwrap_or(60);
         Duration::from_millis(1000 / fps.clamp(1, 120))
     })
 }
@@ -329,26 +326,6 @@ fn primary_to_image(display: &DisplayChannel) -> Option<Arc<RenderImage>> {
 
     let buffer = image::RgbaImage::from_raw(width as u32, height as u32, pixels)?;
 
-    // Keep the frame inside gpui's atlas tile. Anything larger than
-    // DEFAULT_ATLAS_SIZE (1024x1024) cannot share an existing atlas texture,
-    // so the renderer creates a whole new multi-megabyte GPU texture for it —
-    // and since every frame is a new RenderImage, that happens *per frame*.
-    // On Metal that is merely wasteful; on Vulkan/Mesa it stalls the main
-    // thread in wait_for_gpu and the window stops responding entirely.
-    // Downscaling costs nothing visually: the console is letterboxed into an
-    // element far smaller than this anyway.
-    const MAX_ATLAS_TILE: u32 = 1024;
-    let buffer = if buffer.width() > MAX_ATLAS_TILE || buffer.height() > MAX_ATLAS_TILE {
-        let scale = (MAX_ATLAS_TILE as f32 / buffer.width() as f32)
-            .min(MAX_ATLAS_TILE as f32 / buffer.height() as f32);
-        let target = (
-            ((buffer.width() as f32 * scale) as u32).max(1),
-            ((buffer.height() as f32 * scale) as u32).max(1),
-        );
-        image::imageops::resize(&buffer, target.0, target.1, image::imageops::FilterType::Triangle)
-    } else {
-        buffer
-    };
     Some(Arc::new(RenderImage::new(smallvec![Frame::new(buffer)])))
 }
 

@@ -164,6 +164,18 @@ struct IncusManager {
     /// Quick-open palette (⌘P): query plus the highlighted row.
     palette: Option<Palette>,
     palette_focus: gpui::FocusHandle,
+    /// Frames whose GPU texture must not be destroyed yet.
+    ///
+    /// `Window::drop_image` destroys the atlas texture immediately, with no
+    /// fence — safe on Metal, which keeps resources alive until the command
+    /// buffer finishes, but on Vulkan it frees memory the GPU may still be
+    /// reading for the frame in flight. That faults the device, and gpui's
+    /// renderer then spins forever in `while !wait_for(...) {}`, wedging the
+    /// whole window. Holding each retired frame for a few repaints guarantees
+    /// its last use has completed.
+    retired_frames: std::collections::VecDeque<(u64, Arc<RenderImage>)>,
+    /// Repaint counter the retirement queue is measured against.
+    render_seq: u64,
     console_bounds: ConsoleBounds,
     console_focus: gpui::FocusHandle,
     filter_focus: gpui::FocusHandle,
@@ -272,6 +284,27 @@ impl IncusManager {
         }
     }
 
+    /// Hand a frame over for delayed destruction.
+    fn retire_frame(&mut self, frame: Arc<RenderImage>) {
+        self.retired_frames.push_back((self.render_seq, frame));
+    }
+
+    /// Destroy the textures of frames that can no longer be in flight.
+    fn release_retired_frames(&mut self, window: &mut Window) {
+        // Two completed repaints after a frame's last use is comfortably past
+        // anything the renderer can still hold: it waits for the previous
+        // frame's fence before recording the next one.
+        const KEEP_FOR_REPAINTS: u64 = 2;
+        while let Some((seq, _)) = self.retired_frames.front() {
+            if self.render_seq.saturating_sub(*seq) < KEEP_FOR_REPAINTS {
+                break;
+            }
+            if let Some((_, frame)) = self.retired_frames.pop_front() {
+                let _ = window.drop_image(frame);
+            }
+        }
+    }
+
     fn active_tab(&self) -> Option<&ConsoleTab> {
         let active = self.active.as_ref()?;
         self.tabs.iter().find(|t| &t.id == active)
@@ -281,14 +314,14 @@ impl IncusManager {
         self.tabs.iter().any(|t| &t.id == id)
     }
 
-    fn close_tab(&mut self, id: &VmId, window: &mut Window) {
+    fn close_tab(&mut self, id: &VmId, _window: &mut Window) {
         if let Some(pos) = self.tabs.iter().position(|t| &t.id == id) {
             let mut tab = self.tabs.remove(pos);
-            // Same reason the frame pump drops the previous image: a
-            // RenderImage holds a sprite-atlas slot that is only released
-            // explicitly, so closing tabs would otherwise grow it without bound.
+            // Same reason the frame pump retires images: the atlas slot has to
+            // be released explicitly, but only once the GPU can no longer be
+            // reading it.
             if let Some(frame) = tab.frame.take() {
-                let _ = window.drop_image(frame);
+                self.retire_frame(frame);
             }
             tab.handle.stop();
             if self.active.as_ref() == Some(id) {
@@ -385,10 +418,12 @@ impl IncusManager {
                                 let previous = tab.frame.replace(image);
                                 // Each frame is a distinct RenderImage, so its
                                 // atlas entry must be released explicitly or the
-                                // sprite atlas grows without bound.
+                                // sprite atlas grows without bound — but not
+                                // before the GPU is done with it.
                                 if let Some(previous) = previous {
-                                    let _ = window.drop_image(previous);
+                                    state.retire_frame(previous);
                                 }
+                                let _ = window;
                                 // Background tabs keep decoding (that is what
                                 // keeps them warm) but must not force repaints.
                                 if is_active {
@@ -1558,6 +1593,8 @@ impl Render for IncusManager {
         if let Some(tab) = self.active_tab() {
             tab.handle.frame_painted();
         }
+        self.render_seq = self.render_seq.wrapping_add(1);
+        self.release_retired_frames(window);
 
         div()
             .relative()
@@ -1641,6 +1678,8 @@ fn main() {
                         collapsed_groups: Vec::new(),
                         palette: None,
                         palette_focus: cx.focus_handle(),
+                        retired_frames: std::collections::VecDeque::new(),
+                        render_seq: 0,
                         console_bounds: ConsoleBounds::default(),
                         console_focus: cx.focus_handle(),
                         filter_focus: cx.focus_handle(),
