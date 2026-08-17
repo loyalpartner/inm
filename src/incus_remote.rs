@@ -2,21 +2,25 @@
 //! `config.yml`, and opens a connection to it — a local Unix socket, or a
 //! remote server over TLS.
 //!
-//! Only the `default-remote` is used, matching the old CLI-shelling code's
-//! behaviour: it never passed a `<remote>:` prefix either, so it always went
-//! wherever `incus`'s own default pointed. There is no remote switcher here.
+//! Exactly one remote is "current" at a time, starting from `config.yml`'s
+//! own `default-remote` and changeable at runtime via [`switch_to`] — this
+//! mirrors `incus remote switch`, just from inside the app instead of a
+//! separate CLI invocation. There is no simultaneous multi-remote view: VMs
+//! are still identified by (project, name) alone, same as before, so
+//! switching clears whatever the previous remote had open.
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpStream, UnixStream};
 use tokio_rustls::client::TlsStream;
 
-/// Where the daemon is and how to reach it, resolved once per process.
+/// Where the daemon is and how to reach it.
 pub enum Remote {
     Local(PathBuf),
     Tls {
@@ -42,36 +46,100 @@ impl Remote {
     }
 }
 
-/// Only a successful resolution is cached. A failure (servercert not saved
-/// yet, config momentarily unreadable, ...) is retried on the next call
-/// instead of being pinned in place for the rest of the process's life —
-/// otherwise fixing the underlying problem while `inm` keeps running would
-/// need a restart to ever be noticed.
-pub fn resolve() -> Result<&'static Remote, String> {
-    static REMOTE: OnceLock<Remote> = OnceLock::new();
-    if let Some(remote) = REMOTE.get() {
-        return Ok(remote);
-    }
-    let remote = resolve_once()?;
-    Ok(REMOTE.get_or_init(|| remote))
+struct RemoteCache {
+    current_name: String,
+    /// Each named remote's connection details are built once (TLS setup
+    /// involves loading and parsing certs) and kept for the rest of the
+    /// process, same tradeoff as before — just keyed by name now instead of
+    /// there only ever being one slot.
+    resolved: HashMap<String, Arc<Remote>>,
 }
 
-fn resolve_once() -> Result<Remote, String> {
+fn cache() -> &'static Mutex<RemoteCache> {
+    static CACHE: OnceLock<Mutex<RemoteCache>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let current_name = default_remote_name().unwrap_or_else(|_| "local".to_string());
+        Mutex::new(RemoteCache {
+            current_name,
+            resolved: HashMap::new(),
+        })
+    })
+}
+
+/// The remote every call in `incus.rs` should use right now.
+pub fn current() -> Result<Arc<Remote>, String> {
+    let name = cache().lock().unwrap().current_name.clone();
+    resolve(&name)
+}
+
+pub fn current_name() -> String {
+    cache().lock().unwrap().current_name.clone()
+}
+
+/// Every remote in `config.yml` that's actually an Incus server (as opposed
+/// to a plain image server like the stock `images`/`mirror-images`
+/// entries, which have no instances to show).
+pub fn list_remotes() -> Result<Vec<String>, String> {
+    let config = load_config()?;
+    let mut names: Vec<String> = config
+        .remotes
+        .iter()
+        .filter(|(_, r)| r.protocol.as_deref().unwrap_or("incus") == "incus")
+        .map(|(name, _)| name.clone())
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
+/// Switch the current remote. Resolves eagerly (loading/parsing certs for a
+/// never-before-selected remote happens here, synchronously) so a bad
+/// switch — say, a remote whose trust was never established — surfaces
+/// immediately as an error rather than silently on the next VM-list refresh.
+pub fn switch_to(name: &str) -> Result<Arc<Remote>, String> {
+    let remote = resolve(name)?;
+    cache().lock().unwrap().current_name = name.to_string();
+    Ok(remote)
+}
+
+fn resolve(name: &str) -> Result<Arc<Remote>, String> {
+    if let Some(remote) = cache().lock().unwrap().resolved.get(name) {
+        return Ok(remote.clone());
+    }
+    let remote = Arc::new(resolve_named(name)?);
+    cache().lock().unwrap().resolved.insert(name.to_string(), remote.clone());
+    Ok(remote)
+}
+
+fn default_remote_name() -> Result<String, String> {
+    Ok(load_config()?.default_remote.unwrap_or_else(|| "local".to_string()))
+}
+
+fn load_config() -> Result<RawConfig, String> {
     let config_dir = config_dir()?;
     let config_path = config_dir.join("config.yml");
-
     let Ok(raw) = std::fs::read_to_string(&config_path) else {
-        // No CLI config on disk at all: fall back to the conventional local
-        // socket, same as `incus` itself does when unconfigured.
-        return Ok(Remote::Local(local_socket_path()));
+        // No CLI config on disk at all: behave as if only `local` exists,
+        // same as `incus` itself does when unconfigured.
+        return Ok(RawConfig {
+            default_remote: Some("local".to_string()),
+            remotes: HashMap::from([(
+                "local".to_string(),
+                RawRemote {
+                    addr: "unix://".to_string(),
+                    protocol: None,
+                },
+            )]),
+        });
     };
+    serde_yaml::from_str(&raw).map_err(|e| format!("无法解析 {}: {e}", config_path.display()))
+}
 
-    let parsed: RawConfig =
-        serde_yaml::from_str(&raw).map_err(|e| format!("无法解析 {}: {e}", config_path.display()))?;
-    let remote_name = parsed.default_remote.unwrap_or_else(|| "local".to_string());
-    let remote = parsed
+fn resolve_named(remote_name: &str) -> Result<Remote, String> {
+    let config_dir = config_dir()?;
+    let config = load_config()?;
+    let remote = config
         .remotes
-        .get(&remote_name)
+        .get(remote_name)
         .ok_or_else(|| format!("配置中找不到 remote {remote_name:?}"))?;
 
     if remote.addr.is_empty() || remote.addr.starts_with("unix://") {
@@ -133,12 +201,14 @@ fn resolve_once() -> Result<Remote, String> {
 struct RawConfig {
     #[serde(rename = "default-remote")]
     default_remote: Option<String>,
-    remotes: std::collections::HashMap<String, RawRemote>,
+    remotes: HashMap<String, RawRemote>,
 }
 
 #[derive(serde::Deserialize)]
 struct RawRemote {
     addr: String,
+    #[serde(default)]
+    protocol: Option<String>,
 }
 
 /// `incus`'s own config directory: `~/.config/incus` on Linux,

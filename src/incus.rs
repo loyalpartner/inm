@@ -58,8 +58,8 @@ fn encode(value: &str) -> std::borrow::Cow<'_, str> {
 /// these are low-frequency (list/start/console), so a connection pool would
 /// be complexity without payoff.
 async fn request(method: &str, path: &str, body: Option<Value>) -> Result<Value, String> {
-    let remote = incus_remote::resolve()?;
-    let conn = incus_remote::connect(remote).await?;
+    let remote = incus_remote::current()?;
+    let conn = incus_remote::connect(&remote).await?;
     let io = TokioIo::new(conn);
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
         .await
@@ -200,8 +200,8 @@ pub async fn operation_websocket(
     operation_id: &str,
     secret: &str,
 ) -> Result<tokio_tungstenite::WebSocketStream<Connection>, String> {
-    let remote = incus_remote::resolve()?;
-    let conn = incus_remote::connect(remote).await?;
+    let remote = incus_remote::current()?;
+    let conn = incus_remote::connect(&remote).await?;
 
     let scheme = if remote.is_tls() { "wss" } else { "ws" };
     let url = format!(

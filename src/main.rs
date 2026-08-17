@@ -168,6 +168,13 @@ struct IncusManager {
     console_focus: gpui::FocusHandle,
     filter_focus: gpui::FocusHandle,
     host_layout: scancode::HostLayout,
+    /// Remotes read from the `incus` CLI's own `config.yml` (only the ones
+    /// that are actual Incus servers, not plain image servers).
+    remotes: Vec<SharedString>,
+    /// Which remote is currently active — starts at `config.yml`'s
+    /// `default-remote`, changeable from the sidebar header.
+    current_remote: SharedString,
+    remote_switcher_open: bool,
 }
 
 impl IncusManager {
@@ -186,6 +193,34 @@ impl IncusManager {
             .ok();
         })
         .detach();
+    }
+
+    /// Switch which Incus remote the app talks to (mirrors `incus remote
+    /// switch`, just from inside the app). There's no simultaneous
+    /// multi-remote view, so this drops whatever the previous remote had
+    /// open and starts fresh.
+    fn switch_remote(&mut self, name: SharedString, window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(msg) = incus_remote::switch_to(&name) {
+            self.error = Some(msg.into());
+            cx.notify();
+            return;
+        }
+
+        for mut tab in self.tabs.drain(..) {
+            if let Some(frame) = tab.frame.take() {
+                let _ = window.drop_image(frame);
+            }
+            tab.handle.stop();
+        }
+        self.active = None;
+        self.connecting.clear();
+        self.vms.clear();
+        self.grouped.clear();
+        self.error = None;
+        self.current_remote = name;
+        self.remote_switcher_open = false;
+        self.refresh(window, cx);
+        cx.notify();
     }
 
     /// Keep the list fresh without the user having to press anything.
@@ -782,6 +817,57 @@ impl IncusManager {
             )
     }
 
+    /// A small dropdown under the sidebar header listing every remote from
+    /// `config.yml`. Deliberately simpler than the palette — no search, no
+    /// keyboard nav — since it's a short, low-frequency list.
+    fn render_remote_switcher(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            // Click-away closes.
+            .on_mouse_down(
+                GpuiMouseButton::Left,
+                cx.listener(|state, _, _, cx| {
+                    state.remote_switcher_open = false;
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top(px(40.0))
+                    .left(px(12.0))
+                    .w(px(180.0))
+                    .flex()
+                    .flex_col()
+                    .py_1()
+                    .rounded_lg()
+                    .bg(theme::panel())
+                    .border_1()
+                    .border_color(theme::border())
+                    .shadow_lg()
+                    .overflow_hidden()
+                    .children(self.remotes.iter().cloned().map(|name| {
+                        let is_current = name == self.current_remote;
+                        let name_for_click = name.clone();
+                        div()
+                            .id(SharedString::from(format!("remote-{name}")))
+                            .px_3()
+                            .py_1p5()
+                            .text_sm()
+                            .cursor_pointer()
+                            .text_color(if is_current { theme::accent() } else { theme::text() })
+                            .hover(|s| s.bg(theme::hover()))
+                            .child(name)
+                            .on_click(cx.listener(move |state, _, window, cx| {
+                                state.switch_remote(name_for_click.clone(), window, cx);
+                            }))
+                    })),
+            )
+    }
+
     /// Edit the sidebar filter. The box is a plain focusable element rather
     /// than a full text field — it only ever needs append/erase/clear.
     fn handle_filter_key(&mut self, keystroke: &gpui::Keystroke, cx: &mut Context<Self>) {
@@ -852,9 +938,16 @@ impl IncusManager {
                     .flex_shrink_0()
                     .child(
                         div()
+                            .id("remote-switcher-toggle")
+                            .cursor_pointer()
                             .text_xs()
                             .text_color(theme::dim())
-                            .child("虚拟机"),
+                            .hover(|s| s.text_color(theme::text()))
+                            .child(format!("{} ▾", self.current_remote))
+                            .on_click(cx.listener(|state, _, _, cx| {
+                                state.remote_switcher_open = !state.remote_switcher_open;
+                                cx.notify();
+                            })),
                     )
                     .child(
                         div()
@@ -1484,6 +1577,9 @@ impl Render for IncusManager {
             )
             .child(self.render_status_bar(cx))
             .when(self.palette.is_some(), |el| el.child(self.render_palette(cx)))
+            .when(self.remote_switcher_open, |el| {
+                el.child(self.render_remote_switcher(cx))
+            })
     }
 }
 
@@ -1525,6 +1621,13 @@ fn main() {
                         console_focus: cx.focus_handle(),
                         filter_focus: cx.focus_handle(),
                         host_layout: scancode::HostLayout::detect(),
+                        remotes: incus_remote::list_remotes()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(Into::into)
+                            .collect(),
+                        current_remote: incus_remote::current_name().into(),
+                        remote_switcher_open: false,
                     };
                     state.refresh(window, cx);
                     state.start_auto_refresh(window, cx);
