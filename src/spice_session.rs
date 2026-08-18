@@ -18,6 +18,7 @@
 //! * Decoded frames leave that thread as owned pixel buffers; input events
 //!   enter it through a plain channel polled from the loop.
 
+use crate::scancode::button_mask;
 use futures::channel::mpsc;
 use futures::{SinkExt, StreamExt};
 use gpui::RenderImage;
@@ -43,20 +44,6 @@ use tokio_tungstenite::tungstenite::Message;
 /// SPICE_MOUSE_MODE_* (spice-protocol enums.h).
 const MOUSE_MODE_SERVER: i32 = 1;
 const MOUSE_MODE_CLIENT: i32 = 2;
-
-/// SPICE_MOUSE_BUTTON_MASK_* for a SPICE_MOUSE_BUTTON_* button number
-/// (spice-protocol enums.h) — note the mask bits do *not* line up with the
-/// button numbers (right is button 3 but mask bit 1<<2).
-fn button_mask(button: i32) -> i32 {
-    match button {
-        1 => 1 << 0, // LEFT
-        2 => 1 << 1, // MIDDLE
-        3 => 1 << 2, // RIGHT
-        4 => 1 << 3, // UP (wheel)
-        5 => 1 << 4, // DOWN (wheel)
-        _ => 0,
-    }
-}
 
 /// How often a changed surface is turned into a frame.
 ///

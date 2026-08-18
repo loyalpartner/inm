@@ -10,15 +10,13 @@ use gpui::{
     WindowBounds, WindowOptions,
 };
 use incus::{Vm, VmId};
+use scancode::{
+    SPICE_BUTTON_EXTRA, SPICE_BUTTON_LEFT, SPICE_BUTTON_MIDDLE, SPICE_BUTTON_RIGHT,
+    SPICE_BUTTON_SIDE, SPICE_BUTTON_WHEEL_DOWN, SPICE_BUTTON_WHEEL_UP,
+};
 use spice_session::InputEvent;
 use std::sync::Arc;
 use std::time::Duration;
-
-/// SPICE button numbers (spice-protocol SPICE_MOUSE_BUTTON_*).
-const SPICE_BUTTON_LEFT: i32 = 1;
-const SPICE_BUTTON_RIGHT: i32 = 3;
-const SPICE_BUTTON_WHEEL_UP: i32 = 4;
-const SPICE_BUTTON_WHEEL_DOWN: i32 = 5;
 
 /// Pixel distance treated as one wheel notch, for the precise `Pixels` delta
 /// a trackpad reports.
@@ -176,6 +174,10 @@ struct IncusManager {
     /// Modifier state last forwarded to the guest, so releases can be sent as
     /// their own transitions.
     held_modifiers: gpui::Modifiers,
+    /// Host Caps Lock LED state last seen, so a flip can be forwarded as a
+    /// single tap (Caps Lock arrives as a level in `ModifiersChangedEvent`,
+    /// not as its own key-down/up pair).
+    held_capslock: bool,
     /// Keys whose press this app consumed, so their release is not forwarded.
     consumed_keys: std::collections::HashSet<String>,
     /// Tab groups (by project) the user folded away.
@@ -735,8 +737,11 @@ impl IncusManager {
     /// owns that state instead.
     fn send_key(&self, keystroke: &gpui::Keystroke, pressed: bool) {
         let Some(tab) = self.active_tab() else { return };
-        let Some(code) = scancode::scancode_for_host(keystroke.key.as_str(), self.host_layout)
-        else {
+        let Some(code) = scancode::scancode_for_host(
+            keystroke.key.as_str(),
+            self.host_layout,
+            self.held_modifiers.shift,
+        ) else {
             return;
         };
         tab.handle.send_input(if pressed {
@@ -769,6 +774,28 @@ impl IncusManager {
                 tab.handle.send_input(InputEvent::KeyRelease(code));
             }
         }
+    }
+
+    /// Mirror a host Caps Lock toggle into the guest.
+    ///
+    /// Unlike the other modifiers, Caps Lock is a *level* in gpui's own
+    /// `ModifiersChangedEvent` (its LED state), not a press/release pair —
+    /// physical hardware toggles it the same way, though: each press sends a
+    /// normal make+break scancode, and the keyboard controller's own LED
+    /// logic (host and guest alike) is what flips the lock. So on a change,
+    /// tap the key rather than trying to hold it down.
+    fn sync_capslock(&mut self, capslock: gpui::Capslock) {
+        let before = self.held_capslock;
+        self.held_capslock = capslock.on;
+        if capslock.on == before {
+            return;
+        }
+        let Some(tab) = self.active_tab() else { return };
+        let Some(code) = scancode::scancode_for("capslock") else {
+            return;
+        };
+        tab.handle.send_input(InputEvent::KeyPress(code));
+        tab.handle.send_input(InputEvent::KeyRelease(code));
     }
 
     /// App-level shortcuts. Cmd is the modifier because Linux guests almost
@@ -2031,6 +2058,27 @@ impl IncusManager {
                     state.send_mouse_button(SPICE_BUTTON_RIGHT, true);
                 }),
             )
+            .on_mouse_down(
+                GpuiMouseButton::Middle,
+                cx.listener(|state, event: &gpui::MouseDownEvent, _, _| {
+                    state.send_mouse_motion(event.position);
+                    state.send_mouse_button(SPICE_BUTTON_MIDDLE, true);
+                }),
+            )
+            .on_mouse_down(
+                GpuiMouseButton::Navigate(gpui::NavigationDirection::Back),
+                cx.listener(|state, event: &gpui::MouseDownEvent, _, _| {
+                    state.send_mouse_motion(event.position);
+                    state.send_mouse_button(SPICE_BUTTON_SIDE, true);
+                }),
+            )
+            .on_mouse_down(
+                GpuiMouseButton::Navigate(gpui::NavigationDirection::Forward),
+                cx.listener(|state, event: &gpui::MouseDownEvent, _, _| {
+                    state.send_mouse_motion(event.position);
+                    state.send_mouse_button(SPICE_BUTTON_EXTRA, true);
+                }),
+            )
             // gpui does not capture the pointer on press and only fires
             // on_mouse_up while the cursor is still inside, so each button also
             // needs the "released elsewhere" case — otherwise dragging out of
@@ -2039,6 +2087,15 @@ impl IncusManager {
                 [
                     (GpuiMouseButton::Left, SPICE_BUTTON_LEFT),
                     (GpuiMouseButton::Right, SPICE_BUTTON_RIGHT),
+                    (GpuiMouseButton::Middle, SPICE_BUTTON_MIDDLE),
+                    (
+                        GpuiMouseButton::Navigate(gpui::NavigationDirection::Back),
+                        SPICE_BUTTON_SIDE,
+                    ),
+                    (
+                        GpuiMouseButton::Navigate(gpui::NavigationDirection::Forward),
+                        SPICE_BUTTON_EXTRA,
+                    ),
                 ]
                 .into_iter()
                 .fold(el, |el, (gpui_button, spice_button)| {
@@ -2140,6 +2197,7 @@ impl Render for IncusManager {
                 // change in it is exactly when the tab bar needs repainting.
                 let had_cmd = state.held_modifiers.platform;
                 state.sync_modifiers(event.modifiers);
+                state.sync_capslock(event.capslock);
                 if had_cmd != event.modifiers.platform {
                     cx.notify();
                 }
@@ -2210,6 +2268,7 @@ fn main() {
                         error: None,
                         sidebar_visible: true,
                         held_modifiers: gpui::Modifiers::default(),
+                        held_capslock: false,
                         consumed_keys: std::collections::HashSet::new(),
                         collapsed_groups: Vec::new(),
                         context_menu: None,
