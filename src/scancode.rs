@@ -115,7 +115,30 @@ fn active_group_is_dvorak(query: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::active_group_is_dvorak;
+    use super::{HostLayout, active_group_is_dvorak, scancode_for, scancode_for_host};
+
+    #[test]
+    fn shifted_symbol_shares_its_number_keys_scancode() {
+        assert_eq!(scancode_for("1"), scancode_for("!"));
+        assert_eq!(scancode_for("4"), scancode_for("$"));
+        assert_eq!(scancode_for(";"), scancode_for(":"));
+    }
+
+    #[test]
+    fn dvorak_shifted_symbol_resolves_to_the_physical_key_that_types_it() {
+        // Dvorak's "," key sits at the QWERTY "w" position; its shift layer
+        // types "<". The physical key sent to the guest must be "w"'s
+        // (0x11), not the QWERTY comma key's shifted scancode.
+        assert_eq!(
+            scancode_for_host("<", HostLayout::Dvorak),
+            scancode_for("w"),
+        );
+        // Dvorak's "-" key sits at the QWERTY "'" position; shifted, "_".
+        assert_eq!(
+            scancode_for_host("_", HostLayout::Dvorak),
+            scancode_for("'"),
+        );
+    }
 
     #[test]
     fn setxkbmap_dvorak_as_the_first_variant() {
@@ -168,6 +191,14 @@ fn dvorak_to_physical(key: &str) -> &str {
         // Number-row punctuation that Dvorak moves
         "[" => "-", "]" => "=",
 
+        // Shifted punctuation. Same reasoning as `scancode_for`'s own shifted
+        // table: gpui reports these with `modifiers.shift` cleared, so they
+        // must resolve to a physical position on their own. Each maps to the
+        // same QWERTY position as its unshifted sibling above — the shift bit
+        // still reaches the guest via `sync_modifiers`.
+        "\"" => "q", "<" => "w", ">" => "e", "?" => "[", "+" => "]",
+        ":" => "z", "_" => "'", "{" => "-", "}" => "=",
+
         other => other,
     }
 }
@@ -199,6 +230,18 @@ pub fn scancode_for(key: &str) -> Option<u32> {
         "-" => 0x0C, "=" => 0x0D, "[" => 0x1A, "]" => 0x1B, "\\" => 0x2B,
         ";" => 0x27, "'" => 0x28, "`" => 0x29, "," => 0x33, "." => 0x34,
         "/" => 0x35,
+
+        // Shifted punctuation. gpui only keeps `modifiers.shift` set for a-z;
+        // every other key already carries the shifted glyph with shift
+        // cleared (see `Keystroke`'s doc comment), so e.g. shift-1 arrives
+        // here as key "!" rather than key "1" with shift held. Map each back
+        // to the physical key that types it: the shift itself still reaches
+        // the guest, just via `sync_modifiers`'s own ModifiersChanged stream.
+        "!" => 0x02, "@" => 0x03, "#" => 0x04, "$" => 0x05, "%" => 0x06,
+        "^" => 0x07, "&" => 0x08, "*" => 0x09, "(" => 0x0A, ")" => 0x0B,
+        "_" => 0x0C, "+" => 0x0D, "{" => 0x1A, "}" => 0x1B, "|" => 0x2B,
+        ":" => 0x27, "\"" => 0x28, "~" => 0x29, "<" => 0x33, ">" => 0x34,
+        "?" => 0x35,
 
         // Whitespace / editing
         "space" => 0x39,

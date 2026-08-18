@@ -44,6 +44,20 @@ use tokio_tungstenite::tungstenite::Message;
 const MOUSE_MODE_SERVER: i32 = 1;
 const MOUSE_MODE_CLIENT: i32 = 2;
 
+/// SPICE_MOUSE_BUTTON_MASK_* for a SPICE_MOUSE_BUTTON_* button number
+/// (spice-protocol enums.h) — note the mask bits do *not* line up with the
+/// button numbers (right is button 3 but mask bit 1<<2).
+fn button_mask(button: i32) -> i32 {
+    match button {
+        1 => 1 << 0, // LEFT
+        2 => 1 << 1, // MIDDLE
+        3 => 1 << 2, // RIGHT
+        4 => 1 << 3, // UP (wheel)
+        5 => 1 << 4, // DOWN (wheel)
+        _ => 0,
+    }
+}
+
 /// How often a changed surface is turned into a frame.
 ///
 /// A rate cap, not just coalescing of spice-gtk's per-draw damage events:
@@ -90,6 +104,9 @@ impl StartError {
 pub enum InputEvent {
     MouseMotion { x: i32, y: i32 },
     MouseButton { button: i32, pressed: bool },
+    /// SPICE has no continuous wheel; each notch is a press+release of
+    /// button 4 (up) or 5 (down), the X11 wheel-button convention.
+    MouseScroll { button: i32 },
     KeyPress(u32),
     KeyRelease(u32),
     Shutdown,
@@ -459,6 +476,14 @@ fn build_session(req: SessionRequest) -> Result<(), String> {
         let inputs_rx = req.inputs;
         let alive = alive.clone();
         let mut last_pos: Option<(i32, i32)> = None;
+        // Bitmask of currently-held SPICE_MOUSE_BUTTON_MASK_* bits. Motion and
+        // position events must carry this: it is how the guest's pointer
+        // device knows a button is still down mid-drag. Sending 0 there (as
+        // opposed to just on button_press/release) makes a held-button drag
+        // look to the guest like the button released the instant the mouse
+        // moves — window drags and click-drag text selection both silently
+        // stop working, while plain clicks still land fine.
+        let mut button_state: i32 = 0;
         let session = session.clone();
 
         glib::source::timeout_add_local(Duration::from_millis(4), move || {
@@ -496,22 +521,30 @@ fn build_session(req: SessionRequest) -> Result<(), String> {
                     match event {
                         InputEvent::MouseMotion { x, y } => {
                             if mouse_mode.load(Ordering::Relaxed) == MOUSE_MODE_CLIENT {
-                                inputs.position(x, y, 0, 0);
+                                inputs.position(x, y, 0, button_state);
                             } else if let Some((px, py)) = last_pos {
                                 // Relative mode: the guest moves by deltas.
                                 let (dx, dy) = (x - px, y - py);
                                 if dx != 0 || dy != 0 {
-                                    inputs.motion(dx, dy, 0);
+                                    inputs.motion(dx, dy, button_state);
                                 }
                             }
                             last_pos = Some((x, y));
                         }
                         InputEvent::MouseButton { button, pressed } => {
                             if pressed {
-                                inputs.button_press(button, 0)
+                                button_state |= button_mask(button);
+                                inputs.button_press(button, button_state);
                             } else {
-                                inputs.button_release(button, 0)
+                                button_state &= !button_mask(button);
+                                inputs.button_release(button, button_state);
                             }
+                        }
+                        InputEvent::MouseScroll { button } => {
+                            button_state |= button_mask(button);
+                            inputs.button_press(button, button_state);
+                            button_state &= !button_mask(button);
+                            inputs.button_release(button, button_state);
                         }
                         InputEvent::KeyPress(code) => inputs.key_press(code),
                         InputEvent::KeyRelease(code) => inputs.key_release(code),

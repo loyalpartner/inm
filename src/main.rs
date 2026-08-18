@@ -17,6 +17,22 @@ use std::time::Duration;
 /// SPICE button numbers (spice-protocol SPICE_MOUSE_BUTTON_*).
 const SPICE_BUTTON_LEFT: i32 = 1;
 const SPICE_BUTTON_RIGHT: i32 = 3;
+const SPICE_BUTTON_WHEEL_UP: i32 = 4;
+const SPICE_BUTTON_WHEEL_DOWN: i32 = 5;
+
+/// Pixel distance treated as one wheel notch, for the precise `Pixels` delta
+/// a trackpad reports.
+const SCROLL_NOTCH: f32 = 24.0;
+
+/// `ScrollDelta::Lines` magnitude for one physical wheel notch. gpui's own
+/// Linux backends (x11 and wayland) hard-code a `SCROLL_LINES = 3.0`
+/// multiplier onto every discrete wheel event, so one click there reports
+/// 3.0, not 1.0 as on macOS — without correcting for it, Linux scrolls 3x too
+/// fast.
+#[cfg(target_os = "linux")]
+const SCROLL_LINES_PER_NOTCH: f32 = 3.0;
+#[cfg(not(target_os = "linux"))]
+const SCROLL_LINES_PER_NOTCH: f32 = 1.0;
 
 /// How often the instance list is re-read so status dots stay honest.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(10);
@@ -112,6 +128,9 @@ struct ConsoleTab {
     id: VmId,
     handle: spice_session::ConsoleHandle,
     frame: Option<Arc<RenderImage>>,
+    /// Leftover fractional wheel movement below one notch, per tab so
+    /// switching tabs mid-scroll doesn't carry another guest's remainder.
+    scroll_remainder: f32,
 }
 
 impl ConsoleTab {
@@ -438,6 +457,11 @@ impl IncusManager {
         self.tabs.iter().find(|t| &t.id == active)
     }
 
+    fn active_tab_mut(&mut self) -> Option<&mut ConsoleTab> {
+        let active = self.active.clone()?;
+        self.tabs.iter_mut().find(|t| t.id == active)
+    }
+
     fn is_open(&self, id: &VmId) -> bool {
         self.tabs.iter().any(|t| &t.id == id)
     }
@@ -508,6 +532,7 @@ impl IncusManager {
                             id: id.clone(),
                             handle,
                             frame: None,
+                            scroll_remainder: 0.0,
                         };
                         // Keep a project's tabs adjacent so groups stay
                         // contiguous, the way Chrome moves a tab into its
@@ -653,6 +678,32 @@ impl IncusManager {
         if let Some(tab) = self.active_tab() {
             tab.handle
                 .send_input(InputEvent::MouseButton { button, pressed });
+        }
+    }
+
+    /// SPICE carries the wheel as discrete button-4/5 clicks, not a
+    /// continuous delta, so accumulate movement and emit whole notches.
+    fn send_mouse_scroll(&mut self, event: &gpui::ScrollWheelEvent) {
+        let lines = match event.delta {
+            gpui::ScrollDelta::Pixels(delta) => f32::from(delta.y) / SCROLL_NOTCH,
+            gpui::ScrollDelta::Lines(delta) => delta.y / SCROLL_LINES_PER_NOTCH,
+        };
+
+        let Some(tab) = self.active_tab_mut() else {
+            return;
+        };
+        tab.scroll_remainder += lines;
+        let notches = tab.scroll_remainder.trunc();
+        tab.scroll_remainder -= notches;
+
+        let button = if notches > 0.0 {
+            SPICE_BUTTON_WHEEL_UP
+        } else {
+            SPICE_BUTTON_WHEEL_DOWN
+        };
+        // Cap so a single huge trackpad flick cannot flood the guest.
+        for _ in 0..(notches.abs() as u32).min(10) {
+            tab.handle.send_input(InputEvent::MouseScroll { button });
         }
     }
 
@@ -1958,6 +2009,10 @@ impl IncusManager {
             })
             .on_mouse_move(cx.listener(|state, event: &gpui::MouseMoveEvent, _, _| {
                 state.send_mouse_motion(event.position);
+            }))
+            .on_scroll_wheel(cx.listener(|state, event: &gpui::ScrollWheelEvent, _, _| {
+                state.send_mouse_motion(event.position);
+                state.send_mouse_scroll(event);
             }))
             .on_mouse_down(
                 GpuiMouseButton::Left,
