@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#232c3d"/>
+      <stop offset="1" stop-color="#11151d"/>
+    </linearGradient>
+    <linearGradient id="screen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4c7cf0"/>
+      <stop offset="1" stop-color="#1c3d94"/>
+    </linearGradient>
+    <clipPath id="winClip">
+      <rect x="192" y="264" width="640" height="472" rx="40" ry="40"/>
+    </clipPath>
+  </defs>
+
+  <rect width="1024" height="1024" rx="224" ry="224" fill="url(#bg)"/>
+
+  <g clip-path="url(#winClip)">
+    <rect x="192" y="264" width="640" height="472" fill="#dbe3ee"/>
+    <rect x="192" y="264" width="640" height="96" fill="#c1cbdb"/>
+    <rect x="228" y="288" width="164" height="48" rx="12" fill="#f4f7fb"/>
+    <rect x="404" y="288" width="164" height="48" rx="12" fill="#aab6c8"/>
+    <rect x="580" y="288" width="164" height="48" rx="12" fill="#aab6c8"/>
+    <rect x="228" y="384" width="568" height="316" rx="14" fill="url(#screen)"/>
+  </g>
+
+  <circle cx="824" cy="272" r="34" fill="#151a24"/>
+  <circle cx="824" cy="272" r="26" fill="#34d399"/>
+</svg>
