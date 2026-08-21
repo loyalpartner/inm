@@ -281,12 +281,32 @@ pub async fn rename(id: &VmId, new_name: &str) -> Result<(), String> {
 }
 
 pub async fn start(id: &VmId) -> Result<(), String> {
+    change_state(id, "start", false).await
+}
+
+/// Ask the guest to shut down cleanly. Incus falls back to a hard stop on its
+/// own once the instance ignores this past its shutdown timeout, so there is
+/// no separate "force stop" action to expose here.
+pub async fn stop(id: &VmId) -> Result<(), String> {
+    change_state(id, "stop", false).await
+}
+
+pub async fn restart(id: &VmId) -> Result<(), String> {
+    change_state(id, "restart", false).await
+}
+
+async fn change_state(id: &VmId, action: &str, force: bool) -> Result<(), String> {
     let path = format!(
         "/1.0/instances/{}/state?project={}",
         encode(id.name.as_ref()),
         encode(id.project.as_ref())
     );
-    let envelope = request("PUT", &path, Some(serde_json::json!({ "action": "start" }))).await?;
+    let envelope = request(
+        "PUT",
+        &path,
+        Some(serde_json::json!({ "action": action, "force": force })),
+    )
+    .await?;
     let op_id = envelope["metadata"]["id"]
         .as_str()
         .ok_or("响应中缺少 operation id")?;

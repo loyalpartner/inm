@@ -184,6 +184,8 @@ struct IncusManager {
     collapsed_groups: Vec<SharedString>,
     /// Open right-click menu: which instance, and where to draw it.
     context_menu: Option<(VmId, gpui::Point<gpui::Pixels>)>,
+    /// Whether the context menu's "电源" flyout (启动/停止/重启) is open.
+    power_menu_open: bool,
     /// Details dialog: the instance, and its data once it has loaded.
     details: Option<(VmId, Option<incus::VmDetails>)>,
     /// Rename dialog: the instance being renamed and the name being typed.
@@ -590,6 +592,20 @@ impl IncusManager {
                             break;
                         }
                     }
+
+                    // The stream ends both when close_tab() already tore the
+                    // console down (expected — the tab is gone by now, do
+                    // nothing) and when the connection dropped out from under
+                    // a still-open tab (unexpected — say so, instead of
+                    // leaving a frozen console with no explanation).
+                    this.update(cx, |state, cx| {
+                        if state.is_open(&id) {
+                            state.close_tab(&id);
+                            state.error = Some(format!("{} 的控制台连接已断开", id.name).into());
+                            cx.notify();
+                        }
+                    })
+                    .ok();
                 }
                 Err(spice_session::StartError::AlreadyConnected) => {
                     let answer = cx.prompt(
@@ -626,6 +642,47 @@ impl IncusManager {
         cx.spawn_in(window, async move |this, cx| {
             let result = spice_session::runtime()
                 .spawn(async move { incus::start(&id).await })
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()));
+            this.update_in(cx, |state, window, cx| {
+                if let Err(msg) = result {
+                    state.error = Some(msg.into());
+                }
+                state.refresh(window, cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Stopping (or restarting) a VM with an open console tab drops that
+    /// tab's SPICE connection out from under it; the frame stream ending
+    /// unexpectedly is exactly what the "disconnected" handling in
+    /// `connect_console` already surfaces to the user, so there is nothing
+    /// extra to do here for that case.
+    fn stop_vm(&mut self, id: VmId, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this, cx| {
+            let result = spice_session::runtime()
+                .spawn(async move { incus::stop(&id).await })
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()));
+            this.update_in(cx, |state, window, cx| {
+                if let Err(msg) = result {
+                    state.error = Some(msg.into());
+                }
+                state.refresh(window, cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn restart_vm(&mut self, id: VmId, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this, cx| {
+            let result = spice_session::runtime()
+                .spawn(async move { incus::restart(&id).await })
                 .await
                 .unwrap_or_else(|e| Err(e.to_string()));
             this.update_in(cx, |state, window, cx| {
@@ -969,10 +1026,15 @@ impl IncusManager {
         let (id, position) = self.context_menu.clone()?;
         let vm = self.vms.iter().find(|v| v.id == id)?.clone();
         let running = vm.running();
+        let power_menu_open = self.power_menu_open;
 
+        // `closes_power_menu` is set for every top-level item except "电源"
+        // itself, so hovering a sibling closes its flyout the way a native
+        // menu would — only one submenu open at a time.
         let item = |label: SharedString,
                     key: &'static str,
                     enabled: bool,
+                    closes_power_menu: bool,
                     action: Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)>| {
             div()
                 .id(SharedString::from(format!("menu-{key}")))
@@ -986,6 +1048,14 @@ impl IncusManager {
                 })
                 .when(!enabled, |s| s.text_color(theme::faint()))
                 .child(label)
+                .when(closes_power_menu, |s| {
+                    s.on_hover(cx.listener(|state, hovered: &bool, _, cx| {
+                        if *hovered && state.power_menu_open {
+                            state.power_menu_open = false;
+                            cx.notify();
+                        }
+                    }))
+                })
                 .on_click(cx.listener(move |state, _, window, cx| {
                     if enabled {
                         action(state, window, cx);
@@ -994,17 +1064,53 @@ impl IncusManager {
         };
 
         let id_console = id.clone();
-        let id_start = id.clone();
         let id_details = id.clone();
         let id_rename = id.clone();
+        let id_start = id.clone();
+        let id_stop = id.clone();
+        let id_restart = id.clone();
 
         // Keep the menu on screen: anchored at the pointer it would otherwise
         // hang off the bottom for rows near the end of a long sidebar, leaving
         // its last items clipped and unclickable.
         const MENU_SIZE: (f32, f32) = (170.0, 116.0);
+        // Rows are text_sm + px_3/py_1; four of them plus one divider add up
+        // to MENU_SIZE.1 above, so this is that same per-row figure.
+        const ROW_HEIGHT: f32 = 28.0;
+        const SUBMENU_SIZE: (f32, f32) = (110.0, 92.0);
+
         let viewport = window.viewport_size();
         let left = f32::from(position.x).min((f32::from(viewport.width) - MENU_SIZE.0).max(0.0));
         let top = f32::from(position.y).min((f32::from(viewport.height) - MENU_SIZE.1).max(0.0));
+
+        // "电源" is the second row, right below "打开控制台", so its flyout
+        // hangs off that row rather than the menu's top edge. It opens to
+        // whichever side still fits, mirroring the edge-avoidance above.
+        let power_row_top = top + ROW_HEIGHT;
+        let submenu_left = if left + MENU_SIZE.0 + SUBMENU_SIZE.0 <= f32::from(viewport.width) {
+            left + MENU_SIZE.0
+        } else {
+            (left - SUBMENU_SIZE.0).max(0.0)
+        };
+        let submenu_top =
+            power_row_top.min((f32::from(viewport.height) - SUBMENU_SIZE.1).max(0.0));
+
+        // The menu and its flyout are two visually separate panels but must
+        // share one hit-test region: `on_mouse_down_out` below fires on any
+        // press outside that region's own bounds (regardless of DOM
+        // nesting), so if the flyout's screen area were not part of it, a
+        // press on a flyout item would be seen as "outside", dismiss the
+        // menu, and eat the press before the item's own click ever fires.
+        let (union_left, union_top, union_right, union_bottom) = if power_menu_open {
+            (
+                left.min(submenu_left),
+                top.min(submenu_top),
+                (left + MENU_SIZE.0).max(submenu_left + SUBMENU_SIZE.0),
+                (top + MENU_SIZE.1).max(submenu_top + SUBMENU_SIZE.1),
+            )
+        } else {
+            (left, top, left + MENU_SIZE.0, top + MENU_SIZE.1)
+        };
 
         Some(
             div()
@@ -1027,61 +1133,129 @@ impl IncusManager {
                             cx.notify();
                         }))
                         .absolute()
-                        .left(px(left))
-                        .top(px(top))
-                        .w(px(MENU_SIZE.0))
-                        .py_1()
-                        .rounded_md()
-                        .bg(theme::panel())
-                        .border_1()
-                        .border_color(theme::border())
-                        .shadow_lg()
-                        .flex()
-                        .flex_col()
-                        .child(item(
-                            "打开控制台".into(),
-                            "console",
-                            running,
-                            Box::new(move |state, window, cx| {
-                                state.context_menu = None;
-                                state.open_or_focus(id_console.clone(), window, cx);
-                            }),
-                        ))
-                        .child(item(
-                            if running { "已在运行".into() } else { "启动".into() },
-                            "start",
-                            !running,
-                            Box::new(move |state, window, cx| {
-                                state.context_menu = None;
-                                state.start_vm(id_start.clone(), window, cx);
-                            }),
-                        ))
+                        .left(px(union_left))
+                        .top(px(union_top))
+                        .w(px(union_right - union_left))
+                        .h(px(union_bottom - union_top))
                         .child(
                             div()
-                                .my_1()
-                                .h(px(1.0))
-                                .bg(theme::border()),
+                                .absolute()
+                                .left(px(left - union_left))
+                                .top(px(top - union_top))
+                                .w(px(MENU_SIZE.0))
+                                .py_1()
+                                .rounded_md()
+                                .bg(theme::panel())
+                                .border_1()
+                                .border_color(theme::border())
+                                .shadow_lg()
+                                .flex()
+                                .flex_col()
+                                .child(item(
+                                    "打开控制台".into(),
+                                    "console",
+                                    running,
+                                    true,
+                                    Box::new(move |state, window, cx| {
+                                        state.context_menu = None;
+                                        state.open_or_focus(id_console.clone(), window, cx);
+                                    }),
+                                ))
+                                .child(
+                                    div()
+                                        .id("menu-power")
+                                        .px_3()
+                                        .py_1()
+                                        .text_sm()
+                                        .cursor_pointer()
+                                        .text_color(theme::text())
+                                        .hover(|s| s.bg(theme::selected()))
+                                        .flex()
+                                        .flex_row()
+                                        .justify_between()
+                                        .child("电源")
+                                        .child(div().text_color(theme::faint()).child("▸"))
+                                        .on_hover(cx.listener(|state, hovered: &bool, _, cx| {
+                                            if *hovered && !state.power_menu_open {
+                                                state.power_menu_open = true;
+                                                cx.notify();
+                                            }
+                                        })),
+                                )
+                                .child(div().my_1().h(px(1.0)).bg(theme::border()))
+                                .child(item(
+                                    if running {
+                                        "重命名（需先停止）".into()
+                                    } else {
+                                        "重命名".into()
+                                    },
+                                    "rename",
+                                    !running,
+                                    true,
+                                    Box::new(move |state, window, cx| {
+                                        state.begin_rename(id_rename.clone(), window, cx);
+                                    }),
+                                ))
+                                .child(item(
+                                    "详细信息".into(),
+                                    "details",
+                                    true,
+                                    true,
+                                    Box::new(move |state, window, cx| {
+                                        state.show_details(id_details.clone(), window, cx);
+                                    }),
+                                )),
                         )
-                        .child(item(
-                            if running {
-                                "重命名（需先停止）".into()
-                            } else {
-                                "重命名".into()
-                            },
-                            "rename",
-                            !running,
-                            Box::new(move |state, window, cx| {
-                                state.begin_rename(id_rename.clone(), window, cx);
-                            }),
-                        ))
-                        .child(item(
-                            "详细信息".into(),
-                            "details",
-                            true,
-                            Box::new(move |state, window, cx| {
-                                state.show_details(id_details.clone(), window, cx);
-                            }),
-                        )),
+                        .when(power_menu_open, |el| {
+                            el.child(
+                                div()
+                                    .absolute()
+                                    .left(px(submenu_left - union_left))
+                                    .top(px(submenu_top - union_top))
+                                    .w(px(SUBMENU_SIZE.0))
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(theme::panel())
+                                    .border_1()
+                                    .border_color(theme::border())
+                                    .shadow_lg()
+                                    .flex()
+                                    .flex_col()
+                                    .child(item(
+                                        if running { "已在运行".into() } else { "启动".into() },
+                                        "power-start",
+                                        !running,
+                                        false,
+                                        Box::new(move |state, window, cx| {
+                                            state.context_menu = None;
+                                            state.power_menu_open = false;
+                                            state.start_vm(id_start.clone(), window, cx);
+                                        }),
+                                    ))
+                                    .child(item(
+                                        "停止".into(),
+                                        "power-stop",
+                                        running,
+                                        false,
+                                        Box::new(move |state, window, cx| {
+                                            state.context_menu = None;
+                                            state.power_menu_open = false;
+                                            state.stop_vm(id_stop.clone(), window, cx);
+                                        }),
+                                    ))
+                                    .child(item(
+                                        "重启".into(),
+                                        "power-restart",
+                                        running,
+                                        false,
+                                        Box::new(move |state, window, cx| {
+                                            state.context_menu = None;
+                                            state.power_menu_open = false;
+                                            state.restart_vm(id_restart.clone(), window, cx);
+                                        }),
+                                    )),
+                            )
+                        }),
                 ),
         )
     }
@@ -1722,6 +1896,7 @@ impl IncusManager {
                                             cx.listener(move |state, event: &gpui::MouseDownEvent, _, cx| {
                                                 state.context_menu =
                                                     Some((id_menu.clone(), event.position));
+                                                state.power_menu_open = false;
                                                 cx.notify();
                                             }),
                                         )
@@ -1843,6 +2018,10 @@ impl IncusManager {
                             .hover(|s| s.text_color(theme::danger()))
                             .child("✕")
                             .on_click(cx.listener(move |state, _, _, cx| {
+                                // Without this the click also lands on the
+                                // row's own on_click below, which just
+                                // reopened the tab we were closing.
+                                cx.stop_propagation();
                                 state.close_tab(&id_close);
                                 cx.notify();
                             })),
@@ -2272,6 +2451,7 @@ fn main() {
                         consumed_keys: std::collections::HashSet::new(),
                         collapsed_groups: Vec::new(),
                         context_menu: None,
+                        power_menu_open: false,
                         details: None,
                         rename: None,
                         rename_focus: cx.focus_handle(),

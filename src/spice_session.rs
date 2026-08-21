@@ -410,6 +410,18 @@ fn build_session(req: SessionRequest) -> Result<(), String> {
         });
     }
 
+    // Fires both for a deliberate `session.disconnect()` (see the input pump's
+    // Shutdown handling below) and for the guest/network dropping out from
+    // under us. Either way `alive` going false stops the frame timer and
+    // drops `frames`, which is how the UI side learns the console is gone —
+    // it otherwise has no way to notice a connection that died silently.
+    {
+        let alive = alive.clone();
+        session.connect_disconnected(move |_| {
+            alive.set(false);
+        });
+    }
+
     if !session.connect() {
         return Err("SPICE 会话连接失败".into());
     }
