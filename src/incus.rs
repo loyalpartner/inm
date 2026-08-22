@@ -359,16 +359,28 @@ pub async fn operation_websocket(
     operation_id: &str,
     secret: &str,
 ) -> Result<tokio_tungstenite::WebSocketStream<Connection>, String> {
+    connect_ws(&format!(
+        "/1.0/operations/{}/websocket?secret={}",
+        encode(operation_id),
+        encode(secret)
+    ))
+    .await
+}
+
+/// Open a websocket to the daemon's own event stream, filtered to lifecycle
+/// events — instance created/started/stopped/deleted/renamed/... This is
+/// how the sidebar learns about a change someone else made (another
+/// terminal, another user) without waiting for the next poll.
+pub async fn events_websocket() -> Result<tokio_tungstenite::WebSocketStream<Connection>, String> {
+    connect_ws("/1.0/events?type=lifecycle").await
+}
+
+async fn connect_ws(path_and_query: &str) -> Result<tokio_tungstenite::WebSocketStream<Connection>, String> {
     let remote = incus_remote::current()?;
     let conn = incus_remote::connect(&remote).await?;
 
     let scheme = if remote.is_tls() { "wss" } else { "ws" };
-    let url = format!(
-        "{scheme}://{}/1.0/operations/{}/websocket?secret={}",
-        remote.authority(),
-        encode(operation_id),
-        encode(secret)
-    );
+    let url = format!("{scheme}://{}{path_and_query}", remote.authority());
     let request = Request::builder()
         .method("GET")
         .uri(&url)
@@ -387,4 +399,62 @@ pub async fn operation_websocket(
         .await
         .map_err(|e| e.to_string())?;
     Ok(ws)
+}
+
+/// One lifecycle event naming a specific instance — created, started,
+/// stopped, deleted, renamed, ... Anything else the events stream carries
+/// (profiles, networks, other projects' non-instance resources) is filtered
+/// out before this is ever constructed.
+pub struct InstanceEvent {
+    pub action: String,
+    pub id: VmId,
+}
+
+/// Read events off the stream until one names an instance, or the stream
+/// itself ends — a dropped connection or a read error both surface as
+/// `None` here, since the caller's response to either is the same: back off
+/// and reconnect.
+pub async fn next_instance_event(
+    ws: &mut tokio_tungstenite::WebSocketStream<Connection>,
+) -> Option<InstanceEvent> {
+    use futures::StreamExt;
+    while let Some(Ok(msg)) = ws.next().await {
+        let tokio_tungstenite::tungstenite::Message::Text(text) = msg else {
+            continue;
+        };
+        if let Some(event) = parse_instance_event(&text) {
+            return Some(event);
+        }
+    }
+    None
+}
+
+fn parse_instance_event(text: &str) -> Option<InstanceEvent> {
+    let envelope: Value = serde_json::from_str(text).ok()?;
+    if envelope["type"].as_str() != Some("lifecycle") {
+        return None;
+    }
+    let metadata = &envelope["metadata"];
+    let action = metadata["action"].as_str()?.to_string();
+    // e.g. "/1.0/instances/foo?project=bar" — project is omitted for the
+    // default project.
+    let path = metadata["source"].as_str()?.strip_prefix("/1.0/instances/")?;
+    let (name, project) = match path.split_once('?') {
+        Some((name, query)) => (
+            name,
+            query
+                .split('&')
+                .find_map(|kv| kv.strip_prefix("project="))
+                .unwrap_or("default"),
+        ),
+        None => (path, "default"),
+    };
+    let decode = |s: &str| percent_encoding::percent_decode_str(s).decode_utf8().ok().map(|c| c.into_owned());
+    Some(InstanceEvent {
+        action,
+        id: VmId {
+            name: decode(name)?.into(),
+            project: decode(project)?.into(),
+        },
+    })
 }

@@ -32,9 +32,6 @@ const SCROLL_LINES_PER_NOTCH: f32 = 3.0;
 #[cfg(not(target_os = "linux"))]
 const SCROLL_LINES_PER_NOTCH: f32 = 1.0;
 
-/// How often the instance list is re-read so status dots stay honest.
-const REFRESH_INTERVAL: Duration = Duration::from_secs(10);
-
 mod theme {
     use gpui::{rgb, Rgba};
 
@@ -170,6 +167,9 @@ struct IncusManager {
     /// filter edit.
     grouped: Vec<(SharedString, Vec<Vm>)>,
     error: Option<SharedString>,
+    /// Transient status-bar message for a lifecycle event (e.g. a VM someone
+    /// else just created), cleared a few seconds after it's shown.
+    notice: Option<SharedString>,
     sidebar_visible: bool,
     /// Modifier state last forwarded to the guest, so releases can be sent as
     /// their own transitions.
@@ -217,6 +217,10 @@ struct IncusManager {
     /// `default-remote`, changeable from the sidebar header.
     current_remote: SharedString,
     remote_switcher_open: bool,
+    /// Bumped on every remote switch so a still-running event listener from
+    /// the previous remote knows to stop instead of reporting events for a
+    /// remote that is no longer current.
+    remote_epoch: u64,
 }
 
 impl IncusManager {
@@ -270,37 +274,86 @@ impl IncusManager {
         self.vms.clear();
         self.grouped.clear();
         self.error = None;
+        self.notice = None;
         self.current_remote = name;
         self.remote_switcher_open = false;
+        self.remote_epoch += 1;
         self.refresh(window, cx);
+        self.start_event_listener(window, cx);
         cx.notify();
     }
 
-    /// Keep the list fresh without the user having to press anything.
-    fn start_auto_refresh(&self, window: &mut Window, cx: &mut Context<Self>) {
-        cx.spawn_in(window, async move |this, cx| {
+    /// Keep the list fresh without the user having to press anything: an
+    /// instance changing anywhere (created, started, stopped, deleted,
+    /// renamed, ...) pushes a refresh over the daemon's own event stream, so
+    /// there is no polling interval to lag behind. `instance-created`
+    /// additionally surfaces a status-bar notice, since that one is easy to
+    /// otherwise miss in a scrolling list.
+    fn start_event_listener(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let epoch = self.remote_epoch;
+        let (tx, mut rx) = futures::channel::mpsc::unbounded::<incus::InstanceEvent>();
+
+        // The websocket read loop lives entirely on the tokio runtime — same
+        // split as the SPICE frame pump in `spice_session`, since gpui's own
+        // executor cannot poll a tokio I/O type directly. A dropped
+        // `JoinHandle` does not stop the task; it keeps forwarding events
+        // for the life of the process, or until `tx` has no more receivers.
+        spice_session::runtime().spawn(async move {
             loop {
-                cx.background_executor().timer(REFRESH_INTERVAL).await;
-                let result = spice_session::runtime()
-                    .spawn(incus::list_vms())
-                    .await
-                    .unwrap_or_else(|e| Err(e.to_string()));
-                let alive = this
-                    .update(cx, |state, cx| {
-                        match result {
-                            Ok(vms) => {
-                                state.error = None;
-                                state.set_vms(vms);
-                            }
-                            Err(msg) => state.error = Some(msg.into()),
+                if let Ok(mut ws) = incus::events_websocket().await {
+                    while let Some(event) = incus::next_instance_event(&mut ws).await {
+                        if tx.unbounded_send(event).is_err() {
+                            return;
                         }
+                    }
+                }
+                // The daemon doesn't support the endpoint, or the connection
+                // dropped — either way, back off instead of hot-looping.
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+
+        cx.spawn_in(window, async move |this, cx| {
+            use futures::StreamExt;
+            while let Some(event) = rx.next().await {
+                let alive = this
+                    .update_in(cx, |state, window, cx| {
+                        // A newer listener has since taken over for a
+                        // different remote; let this one die quietly.
+                        if state.remote_epoch != epoch {
+                            return false;
+                        }
+                        if event.action == "instance-created" {
+                            state.notice =
+                                Some(format!("已创建虚拟机 {}/{}", event.id.project, event.id.name).into());
+                            state.clear_notice_after(Duration::from_secs(5), window, cx);
+                        }
+                        state.refresh(window, cx);
                         cx.notify();
+                        true
                     })
-                    .is_ok();
+                    .unwrap_or(false);
                 if !alive {
                     break;
                 }
             }
+        })
+        .detach();
+    }
+
+    /// Clear `notice` after `delay`, but only if nothing newer has replaced
+    /// it in the meantime.
+    fn clear_notice_after(&self, delay: Duration, window: &mut Window, cx: &mut Context<Self>) {
+        let showing = self.notice.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            this.update(cx, |state, cx| {
+                if state.notice == showing {
+                    state.notice = None;
+                    cx.notify();
+                }
+            })
+            .ok();
         })
         .detach();
     }
@@ -2336,6 +2389,9 @@ impl IncusManager {
                     .when_some(self.error.clone(), |el, err| {
                         el.child(div().text_xs().text_color(theme::danger()).child(err))
                     })
+                    .when_some(self.notice.clone(), |el, notice| {
+                        el.child(div().text_xs().text_color(theme::accent()).child(notice))
+                    })
                     .when(tab.is_some(), |el| {
                         el.child(
                             div()
@@ -2445,6 +2501,7 @@ fn main() {
                         filter: String::new(),
                         grouped: Vec::new(),
                         error: None,
+                        notice: None,
                         sidebar_visible: true,
                         held_modifiers: gpui::Modifiers::default(),
                         held_capslock: false,
@@ -2470,9 +2527,10 @@ fn main() {
                             .collect(),
                         current_remote: incus_remote::current_name().into(),
                         remote_switcher_open: false,
+                        remote_epoch: 0,
                     };
                     state.refresh(window, cx);
-                    state.start_auto_refresh(window, cx);
+                    state.start_event_listener(window, cx);
                     // Focus the console up front so the shortcuts work before
                     // anything has been opened.
                     window.focus(&state.console_focus);
