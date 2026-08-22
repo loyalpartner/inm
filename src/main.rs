@@ -1,5 +1,6 @@
 mod incus;
 mod incus_remote;
+mod input_source;
 mod scancode;
 mod spice_session;
 
@@ -2531,6 +2532,14 @@ fn main() {
                     };
                     state.refresh(window, cx);
                     state.start_event_listener(window, cx);
+                    // Everything typed in this window is meant literally, not
+                    // composed by an IME — see `input_source`.
+                    cx.observe_window_activation(window, |_state, window, _cx| {
+                        if window.is_window_active() {
+                            input_source::switch_to_ascii_capable();
+                        }
+                    })
+                    .detach();
                     // Focus the console up front so the shortcuts work before
                     // anything has been opened.
                     window.focus(&state.console_focus);
