@@ -69,6 +69,10 @@ done < <(otool -L "$BIN" | tail -n +2 | awk '{print $1}')
 [ "$missing" -eq 0 ] || exit 1
 
 echo "==> Registering with Launch Services / Spotlight"
+# `touch` first: rebuilding a bundle in place leaves Finder and the Dock
+# showing the icon they cached for the old one, and `lsregister -f` alone
+# does not always dislodge it. Bumping the bundle's mtime does.
+touch "$APP_DIR"
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP_DIR"
 mdimport "$APP_DIR" >/dev/null 2>&1 || true
 
