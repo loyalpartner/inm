@@ -198,6 +198,32 @@ struct Palette {
     selected: Option<VmId>,
 }
 
+/// How long a notice stays on the status bar before it takes itself down.
+const NOTICE_LIFETIME: Duration = Duration::from_secs(5);
+
+/// How many status-bar messages are kept before the oldest is dropped. The
+/// strip is one line; more than this and the newest would be pushed off it.
+const MAX_MESSAGES: usize = 3;
+
+/// A status-bar message.
+///
+/// A list rather than the two single slots this replaced (`error` and
+/// `notice`): with one slot each, two operations failing close together left
+/// only the second one visible, and the first was never seen at all.
+struct Message {
+    id: u64,
+    text: SharedString,
+    severity: Severity,
+}
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Severity {
+    /// Something went wrong; stays until the next successful refresh.
+    Error,
+    /// Something happened worth mentioning; expires on its own.
+    Notice,
+}
+
 /// The menu or dialog currently up.
 ///
 /// One field rather than six independent `Option`/`bool`s, because these are
@@ -268,10 +294,12 @@ struct IncusManager {
     /// every delivered video frame while this only changes on a refresh or a
     /// filter edit.
     grouped: Vec<(SharedString, Vec<Vm>)>,
-    error: Option<SharedString>,
-    /// Transient status-bar message for a lifecycle event (e.g. a VM someone
-    /// else just created), cleared a few seconds after it's shown.
-    notice: Option<SharedString>,
+    /// Status-bar messages, oldest first.
+    messages: Vec<Message>,
+    /// Hands each message a distinct identity, so an expiry timer clears the
+    /// message it was started for and not a later one that happens to read
+    /// the same.
+    next_message_id: u64,
     sidebar_visible: bool,
     /// Modifier state last forwarded to the guest, so releases can be sent as
     /// their own transitions.
@@ -333,7 +361,7 @@ impl IncusManager {
             this.update(cx, |state, cx| {
                 match result {
                     Ok(vms) => {
-                        state.error = None;
+                        state.clear_errors();
                         state.set_vms(vms);
                     }
                     // Keep whatever list is already on screen rather than
@@ -341,7 +369,7 @@ impl IncusManager {
                     // remote during auto-refresh, say) — just say why it's
                     // stale instead of leaving the list looking "empty" for
                     // no visible reason.
-                    Err(msg) => state.error = Some(msg.into()),
+                    Err(msg) => state.report_error(msg),
                 }
                 cx.notify();
             })
@@ -356,7 +384,7 @@ impl IncusManager {
     /// open and starts fresh.
     fn switch_remote(&mut self, name: SharedString, window: &mut Window, cx: &mut Context<Self>) {
         if let Err(msg) = incus_remote::switch_to(&name) {
-            self.error = Some(msg.into());
+            self.report_error(msg);
             cx.notify();
             return;
         }
@@ -371,8 +399,7 @@ impl IncusManager {
         self.connecting.clear();
         self.vms.clear();
         self.grouped.clear();
-        self.error = None;
-        self.notice = None;
+        self.messages.clear();
         self.current_remote = name;
         self.remote_epoch += 1;
         self.refresh(window, cx);
@@ -447,10 +474,12 @@ impl IncusManager {
                         if let ListChange::Event(event) = &change
                             && event.action == "instance-created"
                         {
-                            state.notice = Some(
-                                format!("已创建虚拟机 {}/{}", event.id.project, event.id.name).into(),
+                            state.report_notice(
+                                format!("已创建虚拟机 {}/{}", event.id.project, event.id.name),
+                                NOTICE_LIFETIME,
+                                window,
+                                cx,
                             );
-                            state.clear_notice_after(Duration::from_secs(5), window, cx);
                         }
                         state.refresh(window, cx);
                         cx.notify();
@@ -485,13 +514,13 @@ impl IncusManager {
                     .update(cx, |state, cx| {
                         match result {
                             Ok(vms) => {
-                                state.error = None;
+                                state.clear_errors();
                                 state.set_vms(vms);
                             }
                             // Keep whatever is on screen rather than blanking
                             // it on a transient failure — just say why it is
                             // stale.
-                            Err(msg) => state.error = Some(msg.into()),
+                            Err(msg) => state.report_error(msg),
                         }
                         cx.notify();
                     })
@@ -504,21 +533,50 @@ impl IncusManager {
         .detach();
     }
 
-    /// Clear `notice` after `delay`, but only if nothing newer has replaced
-    /// it in the meantime.
-    fn clear_notice_after(&self, delay: Duration, window: &mut Window, cx: &mut Context<Self>) {
-        let showing = self.notice.clone();
+    /// Show a failure. Stays up until the next successful refresh, so a burst
+    /// of failures is all still readable rather than only the last one.
+    fn report_error(&mut self, text: impl Into<SharedString>) {
+        self.push_message(text.into(), Severity::Error);
+    }
+
+    /// Show something that happened, and take it down again after `delay`.
+    fn report_notice(
+        &mut self,
+        text: impl Into<SharedString>,
+        delay: Duration,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = self.push_message(text.into(), Severity::Notice);
         cx.spawn_in(window, async move |this, cx| {
             cx.background_executor().timer(delay).await;
             this.update(cx, |state, cx| {
-                if state.notice == showing {
-                    state.notice = None;
-                    cx.notify();
-                }
+                // By id, not by text: two identical notices are still two
+                // messages, and the first one's timer must not take the
+                // second one down early.
+                state.messages.retain(|m| m.id != id);
+                cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    fn push_message(&mut self, text: SharedString, severity: Severity) -> u64 {
+        let id = self.next_message_id;
+        self.next_message_id += 1;
+        self.messages.push(Message { id, text, severity });
+        // Oldest out first; the newest is the one the user is waiting on.
+        if self.messages.len() > MAX_MESSAGES {
+            self.messages.remove(0);
+        }
+        id
+    }
+
+    /// Drop failures once the thing they were about has evidently recovered.
+    /// Notices are left alone — they are not stale, just short-lived.
+    fn clear_errors(&mut self) {
+        self.messages.retain(|m| m.severity != Severity::Error);
     }
 
     /// Switch the visible console. Kept in one place so the "only the shown
@@ -612,7 +670,7 @@ impl IncusManager {
                 .unwrap_or_else(|e| Err(e.to_string()));
             this.update_in(cx, |state, window, cx| {
                 if let Err(msg) = result {
-                    state.error = Some(msg.into());
+                    state.report_error(msg);
                 }
                 state.refresh(window, cx);
                 cx.notify();
@@ -654,7 +712,7 @@ impl IncusManager {
                         if showing_this_vm {
                             state.overlay = Overlay::None;
                         }
-                        state.error = Some(msg.into());
+                        state.report_error(msg);
                     }
                 }
                 cx.notify();
@@ -723,7 +781,7 @@ impl IncusManager {
 
     /// Open `id` in a tab, or just switch to it when it is already connected.
     fn open_or_focus(&mut self, id: VmId, window: &mut Window, cx: &mut Context<Self>) {
-        self.error = None;
+        self.clear_errors();
         window.focus(&self.console_focus);
 
         if self.is_open(&id) {
@@ -833,7 +891,7 @@ impl IncusManager {
                     this.update(cx, |state, cx| {
                         if state.is_open(&id) {
                             state.close_tab(&id);
-                            state.error = Some(format!("{} 的控制台连接已断开", id.name).into());
+                            state.report_error(format!("{} 的控制台连接已断开", id.name));
                             cx.notify();
                         }
                     })
@@ -860,7 +918,7 @@ impl IncusManager {
                 Err(err) => {
                     this.update(cx, |state, cx| {
                         state.connecting.retain(|c| c != &id);
-                        state.error = Some(err.message().into());
+                        state.report_error(err.message());
                         cx.notify();
                     })
                     .ok();
@@ -891,7 +949,7 @@ impl IncusManager {
                 .unwrap_or_else(|e| Err(e.to_string()));
             this.update_in(cx, |state, window, cx| {
                 if let Err(msg) = result {
-                    state.error = Some(msg.into());
+                    state.report_error(msg);
                 }
                 state.refresh(window, cx);
                 cx.notify();
@@ -1205,7 +1263,7 @@ impl IncusManager {
                     if vm.running() {
                         self.open_or_focus(vm.id, window, cx);
                     } else {
-                        self.error = Some("该虚拟机未运行".into());
+                        self.report_error("该虚拟机未运行");
                     }
                 }
                 return;
@@ -2558,12 +2616,15 @@ impl IncusManager {
                     .flex_row()
                     .gap_3()
                     .items_center()
-                    .when_some(self.error.clone(), |el, err| {
-                        el.child(div().text_xs().text_color(theme::danger()).child(err))
-                    })
-                    .when_some(self.notice.clone(), |el, notice| {
-                        el.child(div().text_xs().text_color(theme::accent()).child(notice))
-                    })
+                    .children(self.messages.iter().map(|message| {
+                        div()
+                            .text_xs()
+                            .text_color(match message.severity {
+                                Severity::Error => theme::danger(),
+                                Severity::Notice => theme::accent(),
+                            })
+                            .child(message.text.clone())
+                    }))
                     .when(tab.is_some(), |el| {
                         el.child(
                             div()
@@ -2674,8 +2735,8 @@ fn main() {
                         collapsed: Vec::new(),
                         filter: String::new(),
                         grouped: Vec::new(),
-                        error: None,
-                        notice: None,
+                        messages: Vec::new(),
+                        next_message_id: 0,
                         sidebar_visible: true,
                         held_modifiers: gpui::Modifiers::default(),
                         held_capslock: false,
