@@ -53,6 +53,26 @@ const EVENT_HEALTHY_AFTER: Duration = Duration::from_secs(60);
 /// over a different instance and action.
 type MenuAction<T> = Box<dyn Fn(&mut T, &mut Window, &mut Context<T>)>;
 
+/// The power operations the context menu offers. They differ only in which
+/// daemon call they make, so they share one code path rather than three
+/// identical copies of the spawn/report/refresh dance.
+#[derive(Clone, Copy)]
+enum PowerAction {
+    Start,
+    Stop,
+    Restart,
+}
+
+impl PowerAction {
+    async fn run(self, id: &VmId) -> Result<(), String> {
+        match self {
+            PowerAction::Start => incus::start(id).await,
+            PowerAction::Stop => incus::stop(id).await,
+            PowerAction::Restart => incus::restart(id).await,
+        }
+    }
+}
+
 /// What the event-stream reader hands the UI.
 enum ListChange {
     /// One instance changed.
@@ -734,8 +754,11 @@ impl IncusManager {
                                 if let Some(previous) = previous {
                                     state.retire_frame(previous);
                                 }
-                                // Background tabs keep decoding (that is what
-                                // keeps them warm) but must not force repaints.
+                                // Only the visible tab repaints. What keeps a
+                                // background tab warm is its SPICE connection
+                                // staying up, not continued decoding —
+                                // `set_visible(false)` stops it converting
+                                // frames at all (see `ConsoleHandle`).
                                 if is_active {
                                     cx.notify();
                                 }
@@ -792,51 +815,23 @@ impl IncusManager {
         .detach();
     }
 
-    fn start_vm(&mut self, id: VmId, window: &mut Window, cx: &mut Context<Self>) {
-        cx.spawn_in(window, async move |this, cx| {
-            let result = spice_session::runtime()
-                .spawn(async move { incus::start(&id).await })
-                .await
-                .unwrap_or_else(|e| Err(e.to_string()));
-            this.update_in(cx, |state, window, cx| {
-                if let Err(msg) = result {
-                    state.error = Some(msg.into());
-                }
-                state.refresh(window, cx);
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
+    /// Run one power action against an instance, then re-read the list.
+    ///
     /// Stopping (or restarting) a VM with an open console tab drops that
     /// tab's SPICE connection out from under it; the frame stream ending
     /// unexpectedly is exactly what the "disconnected" handling in
     /// `connect_console` already surfaces to the user, so there is nothing
     /// extra to do here for that case.
-    fn stop_vm(&mut self, id: VmId, window: &mut Window, cx: &mut Context<Self>) {
+    fn power_action(
+        &mut self,
+        id: VmId,
+        action: PowerAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         cx.spawn_in(window, async move |this, cx| {
             let result = spice_session::runtime()
-                .spawn(async move { incus::stop(&id).await })
-                .await
-                .unwrap_or_else(|e| Err(e.to_string()));
-            this.update_in(cx, |state, window, cx| {
-                if let Err(msg) = result {
-                    state.error = Some(msg.into());
-                }
-                state.refresh(window, cx);
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    fn restart_vm(&mut self, id: VmId, window: &mut Window, cx: &mut Context<Self>) {
-        cx.spawn_in(window, async move |this, cx| {
-            let result = spice_session::runtime()
-                .spawn(async move { incus::restart(&id).await })
+                .spawn(async move { action.run(&id).await })
                 .await
                 .unwrap_or_else(|e| Err(e.to_string()));
             this.update_in(cx, |state, window, cx| {
@@ -1383,7 +1378,7 @@ impl IncusManager {
                                         Box::new(move |state, window, cx| {
                                             state.context_menu = None;
                                             state.power_menu_open = false;
-                                            state.start_vm(id_start.clone(), window, cx);
+                                            state.power_action(id_start.clone(), PowerAction::Start, window, cx);
                                         }),
                                     ))
                                     .child(item(
@@ -1394,7 +1389,7 @@ impl IncusManager {
                                         Box::new(move |state, window, cx| {
                                             state.context_menu = None;
                                             state.power_menu_open = false;
-                                            state.stop_vm(id_stop.clone(), window, cx);
+                                            state.power_action(id_stop.clone(), PowerAction::Stop, window, cx);
                                         }),
                                     ))
                                     .child(item(
@@ -1405,7 +1400,7 @@ impl IncusManager {
                                         Box::new(move |state, window, cx| {
                                             state.context_menu = None;
                                             state.power_menu_open = false;
-                                            state.restart_vm(id_restart.clone(), window, cx);
+                                            state.power_action(id_restart.clone(), PowerAction::Restart, window, cx);
                                         }),
                                     )),
                             )
@@ -2030,8 +2025,9 @@ impl IncusManager {
                                                     .child("▶")
                                                     .on_click(cx.listener(
                                                         move |state, _, window, cx| {
-                                                            state.start_vm(
+                                                            state.power_action(
                                                                 id_start.clone(),
+                                                                PowerAction::Start,
                                                                 window,
                                                                 cx,
                                                             );
