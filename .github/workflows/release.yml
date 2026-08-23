@@ -5,12 +5,20 @@ on:
     tags: ["v*"]
 
 jobs:
+  # A tag used to go straight to a published release and an AUR push without
+  # the code ever being built or tested. Gate both on the same checks CI runs
+  # on master, so a broken tag fails here instead of on every Arch user's
+  # machine.
+  verify:
+    uses: ./.github/workflows/ci.yml
+
   create-release:
+    needs: verify
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: taiki-e/create-gh-release-action@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -21,7 +29,7 @@ jobs:
     needs: create-release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Render PKGBUILD with the release tarball's checksum
         run: |

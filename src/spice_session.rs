@@ -33,12 +33,12 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::runtime::Runtime;
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 use tokio_tungstenite::tungstenite::Message;
 
 /// SPICE_MOUSE_MODE_* (spice-protocol enums.h).
@@ -133,24 +133,54 @@ impl ConsoleHandle {
         self.mouse_mode.load(Ordering::Relaxed) == MOUSE_MODE_CLIENT
     }
 
+    /// Ask the SPICE session to shut down, then tear the tunnel down by
+    /// dropping the proxy.
     pub fn stop(self) {
         let _ = self.input.send(InputEvent::Shutdown);
-        self._proxy.data_task.abort();
-        self._proxy.control_task.abort();
-        let socket_path = self._proxy.socket_path;
-        runtime().spawn(async move {
-            let _ = tokio::fs::remove_file(&socket_path).await;
-        });
+        // `_proxy`'s `Drop` does the rest.
+    }
+}
+
+/// Unlinks the proxy socket when the tunnel goes away — including down every
+/// error path in [`start_console`], which is exactly where the file used to
+/// be left behind.
+struct SocketFile(PathBuf);
+
+impl Drop for SocketFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 
 /// The bridge between the Incus operation's websockets and the local Unix
-/// socket spice-client-glib dials into. Dropping/aborting the tasks tears the
-/// tunnel down; the socket file itself needs an explicit removal.
+/// socket spice-client-glib dials into.
+///
+/// Tearing this down is `Drop`'s job, not the caller's. Dropping a tokio
+/// `JoinHandle` only *detaches* the task, so an earlier version of this
+/// comment claiming a drop tore the tunnel down was wrong in a way that
+/// leaked: every `?` in `start_console` left the accept loop, the control
+/// drain, the per-channel pumps and the socket file running, and the daemon
+/// went on considering the console attached — so the next attempt to open it
+/// hit `AlreadyConnected` and forced the user through "强制接管".
 struct ConsoleProxy {
     data_task: JoinHandle<()>,
     control_task: JoinHandle<()>,
-    socket_path: PathBuf,
+    /// One per SPICE channel (main/display/inputs/cursor/...), spawned by the
+    /// accept loop as the guest dials in. They are not reachable from
+    /// `data_task`, so they need collecting here to be abortable at all.
+    pumps: Arc<Mutex<Vec<AbortHandle>>>,
+    /// Dropped last, after the tasks that use it are aborted.
+    _socket: SocketFile,
+}
+
+impl Drop for ConsoleProxy {
+    fn drop(&mut self) {
+        self.data_task.abort();
+        self.control_task.abort();
+        for pump in self.pumps.lock().unwrap().drain(..) {
+            pump.abort();
+        }
+    }
 }
 
 /// A local path no other `inm` console tab is using yet. Good enough for a
@@ -164,6 +194,19 @@ fn unique_socket_path() -> PathBuf {
 
 /// Shuttle bytes between spice-client-glib's local connection and the
 /// operation's SPICE data websocket until either side closes.
+///
+/// The two directions are raced, not joined. Joining them deadlocked: they
+/// never cancel each other, and `tokio::io::split`'s halves share one fd, so
+/// dropping the write half does not shut the socket down. A finished
+/// `to_local` therefore left `to_ws` parked on a `read` that spice-gtk had no
+/// reason to end, one leaked task per SPICE channel.
+///
+/// It also broke disconnect detection, which matters more: display and cursor
+/// are effectively server→client only, so their `to_ws` sees neither a write
+/// error nor EOF, and spice-gtk never learns those channels died. Whether the
+/// UI noticed a dropped console came down to how soon spice-gtk's own ping
+/// happened to fail on the main channel. Closing both halves as soon as
+/// either direction ends makes that deterministic.
 async fn pump_console_data(
     local: UnixStream,
     ws: tokio_tungstenite::WebSocketStream<crate::incus_remote::Connection>,
@@ -171,7 +214,7 @@ async fn pump_console_data(
     let (mut ws_write, mut ws_read) = ws.split();
     let (mut local_read, mut local_write) = tokio::io::split(local);
 
-    let to_ws = async move {
+    let to_ws = async {
         let mut buf = [0u8; 16 * 1024];
         loop {
             match local_read.read(&mut buf).await {
@@ -183,10 +226,9 @@ async fn pump_console_data(
                 }
             }
         }
-        let _ = ws_write.close().await;
     };
 
-    let to_local = async move {
+    let to_local = async {
         while let Some(msg) = ws_read.next().await {
             match msg {
                 Ok(Message::Binary(data)) => {
@@ -198,9 +240,20 @@ async fn pump_console_data(
                 _ => {}
             }
         }
+        // Half of the split; shutting it down closes the shared fd, which is
+        // what unblocks `local_read` in the other direction.
+        let _ = local_write.shutdown().await;
     };
 
-    tokio::join!(to_ws, to_local);
+    tokio::select! {
+        _ = to_ws => {}
+        _ = to_local => {}
+    }
+
+    // Whichever direction lost the race is cancelled by `select!` dropping
+    // it, so close both ends explicitly rather than relying on that drop.
+    let _ = ws_write.close().await;
+    let _ = local_write.shutdown().await;
 }
 
 /// Open a VM's SPICE console via the daemon's own REST API and proxy it onto
@@ -226,6 +279,16 @@ async fn spawn_incus_console(
         }
     })?;
 
+    // Bind before anything is spawned, so a failure here (a full or read-only
+    // TMPDIR, a path over `sun_path`'s 104-byte limit) cannot strand a
+    // half-built tunnel that keeps the console attached daemon-side.
+    let socket_path = unique_socket_path();
+    let _ = std::fs::remove_file(&socket_path);
+    let listener = UnixListener::bind(&socket_path)
+        .map_err(|e| StartError::Message(format!("无法创建本地代理 socket: {e}")))?;
+    // From here on the file is owned: every `?` below unlinks it again.
+    let socket_file = SocketFile(socket_path.clone());
+
     // The control channel just needs to stay open for the daemon to consider
     // this console attached; there is nothing to send for a VGA console (that
     // is only used for text-console resize events), so just drain it and let
@@ -238,11 +301,6 @@ async fn spawn_incus_console(
         while control_ws.next().await.is_some() {}
     });
 
-    let socket_path = unique_socket_path();
-    let _ = std::fs::remove_file(&socket_path);
-    let listener = UnixListener::bind(&socket_path)
-        .map_err(|e| StartError::Message(format!("无法创建本地代理 socket: {e}")))?;
-
     // SPICE opens one connection per channel (main, display, inputs, cursor,
     // ...), not one connection for the whole session — so keep accepting,
     // and give every new local connection its own fresh websocket against
@@ -251,7 +309,8 @@ async fn spawn_incus_console(
     // once per connection.
     let operation_id = op.id.clone();
     let data_secret = op.data_secret.clone();
-    let socket_path_for_task = socket_path.clone();
+    let pumps: Arc<Mutex<Vec<AbortHandle>>> = Arc::default();
+    let pumps_for_task = pumps.clone();
     let data_task = runtime().spawn(async move {
         loop {
             let Ok((conn, _)) = listener.accept().await else {
@@ -259,20 +318,25 @@ async fn spawn_incus_console(
             };
             let operation_id = operation_id.clone();
             let data_secret = data_secret.clone();
-            tokio::spawn(async move {
+            let pump = tokio::spawn(async move {
                 if let Ok(ws) = crate::incus::operation_websocket(&operation_id, &data_secret).await {
                     pump_console_data(conn, ws).await;
                 }
             });
+            let mut pumps = pumps_for_task.lock().unwrap();
+            // A channel that has already closed needs no aborting; dropping
+            // those keeps this from growing for the life of the session.
+            pumps.retain(|p| !p.is_finished());
+            pumps.push(pump.abort_handle());
         }
-        let _ = tokio::fs::remove_file(&socket_path_for_task).await;
     });
 
     Ok((
         ConsoleProxy {
             data_task,
             control_task,
-            socket_path: socket_path.clone(),
+            pumps,
+            _socket: socket_file,
         },
         socket_path,
     ))
@@ -322,7 +386,7 @@ fn primary_to_image(display: &DisplayChannel) -> Option<Arc<RenderImage>> {
                 *px |= 0xFF00_0000;
             }
         } else {
-            for px in row.chunks_exact_mut(4) {
+            for px in row.as_chunks_mut::<4>().0 {
                 px[3] = 255;
             }
         }
@@ -456,14 +520,22 @@ fn build_session(req: SessionRequest) -> Result<(), String> {
                 return glib::ControlFlow::Continue;
             }
             if dirty.replace(false) {
-                if let Some(display) = display_channel.borrow().as_ref() {
-                    if let Some(image) = primary_to_image(display) {
+                match display_channel.borrow().as_ref().and_then(primary_to_image) {
+                    Some(image) => {
                         in_flight.store(true, Ordering::Relaxed);
                         if frames.unbounded_send(image).is_err() {
                             alive.set(false);
                             return glib::ControlFlow::Break;
                         }
                     }
+                    // Put the damage back. `primary_to_image` returns None
+                    // while the surface is still being set up or is not 32-bit
+                    // yet, and clearing `dirty` for an attempt that produced
+                    // nothing would drop that damage for good: on a static
+                    // guest screen the next invalidate can be minutes away, so
+                    // the console would sit blank until the user moved the
+                    // mouse in it.
+                    None => dirty.set(true),
                 }
             }
             glib::ControlFlow::Continue

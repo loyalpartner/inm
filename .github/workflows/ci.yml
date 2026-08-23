@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  # So release.yml can gate a tag on the same checks instead of duplicating
+  # them.
+  workflow_call:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS is where inm is developed and what the Homebrew formula
+        # builds; Linux is what the AUR package builds. A break on either
+        # ships to real users, so both gate a release.
+        os: [macos-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install spice-gtk (macOS)
+        if: runner.os == 'macOS'
+        run: brew install spice-gtk
+
+      # gpui links X11/Wayland/xkbcommon/Vulkan directly, and
+      # spice-client-glib needs its own -dev package; the AUR PKGBUILD's
+      # `depends` is the same set expressed in Arch's names.
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libspice-client-glib-2.0-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+            libvulkan-dev \
+            libasound2-dev libfontconfig-dev libssl-dev
+
+      # Pinned, not `stable`. With `-D warnings`, a floating toolchain turns
+      # every Rust release into a possible red PR that has nothing to do with
+      # the change under review — 1.98 added `manual_chunks`, which failed a
+      # branch that passed clippy locally on 1.97. Bumping this is a
+      # deliberate one-line commit that carries any new lint fixes with it.
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `--locked` so a stale Cargo.lock fails here rather than surfacing as a
+      # different dependency set in the published build.
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+        env:
+          PKG_CONFIG_PATH: ${{ runner.os == 'macOS' && '/opt/homebrew/opt/spice-gtk/lib/pkgconfig' || '' }}
+
+      - name: Test
+        run: cargo test --locked
+        env:
+          PKG_CONFIG_PATH: ${{ runner.os == 'macOS' && '/opt/homebrew/opt/spice-gtk/lib/pkgconfig' || '' }}
+
+      - name: Build release
+        run: cargo build --release --locked
+        env:
+          PKG_CONFIG_PATH: ${{ runner.os == 'macOS' && '/opt/homebrew/opt/spice-gtk/lib/pkgconfig' || '' }}

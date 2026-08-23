@@ -18,7 +18,9 @@ switching back is instant.
 ## Features
 
 - **Project tree** — every VM across every Incus project, live status, search
-  (`⌘F`), auto-refreshed.
+  (`⌘F`). The list follows the daemon's own event stream, so a machine
+  someone else creates, starts or stops shows up as it happens rather than on
+  the next poll.
 - **Tab groups** — tabs are grouped by project the way Chrome groups tabs, with
   a stable colour per project and collapsible groups.
 - **Embedded console** — the guest screen is decoded by spice-gtk and painted
@@ -40,6 +42,10 @@ switching back is instant.
   shown in the status bar.
 - **Ctrl+Alt+Del** — sendable from the status bar, since a Mac keyboard cannot
   type it.
+- **No IME in the way** (macOS) — activating the window selects a plain
+  keyboard layout, so console keystrokes reach the guest as literal
+  characters instead of a composition candidate window; whatever input source
+  you were using is restored when you switch away.
 
 ## How it works
 
@@ -61,6 +67,13 @@ Incus daemon REST API  ──►  data + control websockets  ──►  libspice
   including its self-signed pinned-certificate trust model
   (`~/.config/incus/servercerts/<remote>.crt`). Run `incus remote add` first
   to establish that trust; `inm` reuses it, it doesn't create it.
+- The instance list is driven by `GET /1.0/events?type=lifecycle`, the same
+  stream `incus monitor` reads — `all-projects=true`, since that endpoint is
+  otherwise scoped to a single project while the sidebar shows them all. A
+  slow poll runs underneath it: a websocket can stop delivering without ever
+  erroring, so the stream pings to detect a half-open socket, re-reads the
+  full list on every reconnect, and the poll bounds how long a stream that
+  fails outright can leave the list stale.
 - Protocol and image decoding are spice-gtk's — the same library
   `remote-viewer` uses.
 - All SPICE sessions share **one** GLib thread and one main loop. A

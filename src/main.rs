@@ -33,6 +33,55 @@ const SCROLL_LINES_PER_NOTCH: f32 = 3.0;
 #[cfg(not(target_os = "linux"))]
 const SCROLL_LINES_PER_NOTCH: f32 = 1.0;
 
+/// How often the instance list is re-read even when the event stream has
+/// reported nothing — see [`IncusManager::start_refresh_watchdog`]. Long,
+/// because events carry the latency-sensitive updates; this only has to
+/// bound how long a *broken* stream can hide.
+const WATCHDOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How long to wait before redialling the event stream after it drops or
+/// fails to connect, and the ceiling that delay doubles up to while it keeps
+/// failing.
+const EVENT_RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
+const EVENT_RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+/// A stream that stayed connected at least this long counts as healthy, so
+/// the next reconnect starts from the short delay again.
+const EVENT_HEALTHY_AFTER: Duration = Duration::from_secs(60);
+
+/// What a context-menu row does when clicked. Boxed because each row closes
+/// over a different instance and action.
+type MenuAction<T> = Box<dyn Fn(&mut T, &mut Window, &mut Context<T>)>;
+
+/// The power operations the context menu offers. They differ only in which
+/// daemon call they make, so they share one code path rather than three
+/// identical copies of the spawn/report/refresh dance.
+#[derive(Clone, Copy)]
+enum PowerAction {
+    Start,
+    Stop,
+    Restart,
+}
+
+impl PowerAction {
+    async fn run(self, id: &VmId) -> Result<(), String> {
+        match self {
+            PowerAction::Start => incus::start(id).await,
+            PowerAction::Stop => incus::stop(id).await,
+            PowerAction::Restart => incus::restart(id).await,
+        }
+    }
+}
+
+/// What the event-stream reader hands the UI.
+enum ListChange {
+    /// One instance changed.
+    Event(incus::InstanceEvent),
+    /// The stream just (re)connected, so anything that happened while it was
+    /// down was missed and the list has to be re-read from scratch.
+    Resync,
+}
+
 mod theme {
     use gpui::{rgb, Rgba};
 
@@ -222,6 +271,11 @@ struct IncusManager {
     /// the previous remote knows to stop instead of reporting events for a
     /// remote that is no longer current.
     remote_epoch: u64,
+    /// Cancels the previous remote's event-stream reader. Dropping a tokio
+    /// `JoinHandle` only detaches it, so without this an listener parked on a
+    /// quiet remote's socket would live — and eventually *reconnect*, to
+    /// whichever remote is current by then — for the rest of the process.
+    event_task: Option<tokio::task::AbortHandle>,
 }
 
 impl IncusManager {
@@ -287,36 +341,60 @@ impl IncusManager {
     /// Keep the list fresh without the user having to press anything: an
     /// instance changing anywhere (created, started, stopped, deleted,
     /// renamed, ...) pushes a refresh over the daemon's own event stream, so
-    /// there is no polling interval to lag behind. `instance-created`
-    /// additionally surfaces a status-bar notice, since that one is easy to
-    /// otherwise miss in a scrolling list.
-    fn start_event_listener(&self, window: &mut Window, cx: &mut Context<Self>) {
+    /// the status dots do not lag a change made outside inm.
+    /// `instance-created` additionally surfaces a status-bar notice, since
+    /// that one is easy to otherwise miss in a scrolling list.
+    ///
+    /// [`start_refresh_watchdog`] still runs underneath: the event stream is
+    /// the fast path, not the only one.
+    fn start_event_listener(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let epoch = self.remote_epoch;
-        let (tx, mut rx) = futures::channel::mpsc::unbounded::<incus::InstanceEvent>();
+        let (tx, mut rx) = futures::channel::mpsc::unbounded::<ListChange>();
 
         // The websocket read loop lives entirely on the tokio runtime — same
         // split as the SPICE frame pump in `spice_session`, since gpui's own
-        // executor cannot poll a tokio I/O type directly. A dropped
-        // `JoinHandle` does not stop the task; it keeps forwarding events
-        // for the life of the process, or until `tx` has no more receivers.
-        spice_session::runtime().spawn(async move {
+        // executor cannot poll a tokio I/O type directly.
+        let task = spice_session::runtime().spawn(async move {
+            let mut backoff = EVENT_RECONNECT_BACKOFF;
             loop {
+                // A failure to connect is not reported here: the watchdog
+                // poll is what surfaces a daemon that cannot be reached.
                 if let Ok(mut ws) = incus::events_websocket().await {
+                    let connected_at = tokio::time::Instant::now();
+                    // Whatever happened while the stream was down was missed
+                    // outright, so a fresh connection starts by re-reading
+                    // the list rather than trusting what is on screen and
+                    // waiting for the next event.
+                    if tx.unbounded_send(ListChange::Resync).is_err() {
+                        return;
+                    }
                     while let Some(event) = incus::next_instance_event(&mut ws).await {
-                        if tx.unbounded_send(event).is_err() {
+                        if tx.unbounded_send(ListChange::Event(event)).is_err() {
                             return;
                         }
                     }
+                    // A stream that stayed up is a working one, however it
+                    // ended; only a connection that collapses immediately
+                    // should slow the next attempt down.
+                    if connected_at.elapsed() >= EVENT_HEALTHY_AFTER {
+                        backoff = EVENT_RECONNECT_BACKOFF;
+                    }
                 }
-                // The daemon doesn't support the endpoint, or the connection
-                // dropped — either way, back off instead of hot-looping.
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                // Without this, a daemon that accepts the upgrade and then
+                // drops the stream would have inm re-reading the whole list
+                // every few seconds, harder than the poll this replaced.
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(EVENT_RECONNECT_BACKOFF_MAX);
             }
         });
+        // Replaces (and cancels) whichever remote's listener was running.
+        if let Some(previous) = self.event_task.replace(task.abort_handle()) {
+            previous.abort();
+        }
 
         cx.spawn_in(window, async move |this, cx| {
             use futures::StreamExt;
-            while let Some(event) = rx.next().await {
+            while let Some(change) = rx.next().await {
                 let alive = this
                     .update_in(cx, |state, window, cx| {
                         // A newer listener has since taken over for a
@@ -324,9 +402,12 @@ impl IncusManager {
                         if state.remote_epoch != epoch {
                             return false;
                         }
-                        if event.action == "instance-created" {
-                            state.notice =
-                                Some(format!("已创建虚拟机 {}/{}", event.id.project, event.id.name).into());
+                        if let ListChange::Event(event) = &change
+                            && event.action == "instance-created"
+                        {
+                            state.notice = Some(
+                                format!("已创建虚拟机 {}/{}", event.id.project, event.id.name).into(),
+                            );
                             state.clear_notice_after(Duration::from_secs(5), window, cx);
                         }
                         state.refresh(window, cx);
@@ -334,6 +415,45 @@ impl IncusManager {
                         true
                     })
                     .unwrap_or(false);
+                if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// A slow poll underneath the event stream.
+    ///
+    /// Not redundant with it: a websocket can stop delivering without ever
+    /// erroring, and while [`incus::next_instance_event`] now pings to catch
+    /// that, the daemon can also be unreachable, mid-restart, or too old to
+    /// serve the endpoint at all. This is the path that both recovers the
+    /// list and surfaces *why* it is stale, so a broken event stream degrades
+    /// to the old polling behaviour instead of to a frozen sidebar.
+    fn start_refresh_watchdog(&self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(WATCHDOG_INTERVAL).await;
+                let result = spice_session::runtime()
+                    .spawn(incus::list_vms())
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()));
+                let alive = this
+                    .update(cx, |state, cx| {
+                        match result {
+                            Ok(vms) => {
+                                state.error = None;
+                                state.set_vms(vms);
+                            }
+                            // Keep whatever is on screen rather than blanking
+                            // it on a transient failure — just say why it is
+                            // stale.
+                            Err(msg) => state.error = Some(msg.into()),
+                        }
+                        cx.notify();
+                    })
+                    .is_ok();
                 if !alive {
                     break;
                 }
@@ -414,10 +534,10 @@ impl IncusManager {
                 }
             }
             _ => {
-                if let Some(ch) = keystroke.key_char.as_ref() {
-                    if ch.chars().all(|c| !c.is_control()) {
-                        name.push_str(ch);
-                    }
+                if let Some(ch) = keystroke.key_char.as_ref()
+                    && ch.chars().all(|c| !c.is_control())
+                {
+                    name.push_str(ch);
                 }
             }
         }
@@ -634,8 +754,11 @@ impl IncusManager {
                                 if let Some(previous) = previous {
                                     state.retire_frame(previous);
                                 }
-                                // Background tabs keep decoding (that is what
-                                // keeps them warm) but must not force repaints.
+                                // Only the visible tab repaints. What keeps a
+                                // background tab warm is its SPICE connection
+                                // staying up, not continued decoding —
+                                // `set_visible(false)` stops it converting
+                                // frames at all (see `ConsoleHandle`).
                                 if is_active {
                                     cx.notify();
                                 }
@@ -692,51 +815,23 @@ impl IncusManager {
         .detach();
     }
 
-    fn start_vm(&mut self, id: VmId, window: &mut Window, cx: &mut Context<Self>) {
-        cx.spawn_in(window, async move |this, cx| {
-            let result = spice_session::runtime()
-                .spawn(async move { incus::start(&id).await })
-                .await
-                .unwrap_or_else(|e| Err(e.to_string()));
-            this.update_in(cx, |state, window, cx| {
-                if let Err(msg) = result {
-                    state.error = Some(msg.into());
-                }
-                state.refresh(window, cx);
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
+    /// Run one power action against an instance, then re-read the list.
+    ///
     /// Stopping (or restarting) a VM with an open console tab drops that
     /// tab's SPICE connection out from under it; the frame stream ending
     /// unexpectedly is exactly what the "disconnected" handling in
     /// `connect_console` already surfaces to the user, so there is nothing
     /// extra to do here for that case.
-    fn stop_vm(&mut self, id: VmId, window: &mut Window, cx: &mut Context<Self>) {
+    fn power_action(
+        &mut self,
+        id: VmId,
+        action: PowerAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         cx.spawn_in(window, async move |this, cx| {
             let result = spice_session::runtime()
-                .spawn(async move { incus::stop(&id).await })
-                .await
-                .unwrap_or_else(|e| Err(e.to_string()));
-            this.update_in(cx, |state, window, cx| {
-                if let Err(msg) = result {
-                    state.error = Some(msg.into());
-                }
-                state.refresh(window, cx);
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    fn restart_vm(&mut self, id: VmId, window: &mut Window, cx: &mut Context<Self>) {
-        cx.spawn_in(window, async move |this, cx| {
-            let result = spice_session::runtime()
-                .spawn(async move { incus::restart(&id).await })
+                .spawn(async move { action.run(&id).await })
                 .await
                 .unwrap_or_else(|e| Err(e.to_string()));
             this.update_in(cx, |state, window, cx| {
@@ -1061,11 +1156,11 @@ impl IncusManager {
                 return;
             }
             _ => {
-                if let Some(ch) = keystroke.key_char.as_ref() {
-                    if ch.chars().all(|c| !c.is_control()) {
-                        palette.query.push_str(ch);
-                        palette.selected = None;
-                    }
+                if let Some(ch) = keystroke.key_char.as_ref()
+                    && ch.chars().all(|c| !c.is_control())
+                {
+                    palette.query.push_str(ch);
+                    palette.selected = None;
                 }
             }
         }
@@ -1089,7 +1184,7 @@ impl IncusManager {
                     key: &'static str,
                     enabled: bool,
                     closes_power_menu: bool,
-                    action: Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)>| {
+                    action: MenuAction<Self>| {
             div()
                 .id(SharedString::from(format!("menu-{key}")))
                 .px_3()
@@ -1283,7 +1378,7 @@ impl IncusManager {
                                         Box::new(move |state, window, cx| {
                                             state.context_menu = None;
                                             state.power_menu_open = false;
-                                            state.start_vm(id_start.clone(), window, cx);
+                                            state.power_action(id_start.clone(), PowerAction::Start, window, cx);
                                         }),
                                     ))
                                     .child(item(
@@ -1294,7 +1389,7 @@ impl IncusManager {
                                         Box::new(move |state, window, cx| {
                                             state.context_menu = None;
                                             state.power_menu_open = false;
-                                            state.stop_vm(id_stop.clone(), window, cx);
+                                            state.power_action(id_stop.clone(), PowerAction::Stop, window, cx);
                                         }),
                                     ))
                                     .child(item(
@@ -1305,7 +1400,7 @@ impl IncusManager {
                                         Box::new(move |state, window, cx| {
                                             state.context_menu = None;
                                             state.power_menu_open = false;
-                                            state.restart_vm(id_restart.clone(), window, cx);
+                                            state.power_action(id_restart.clone(), PowerAction::Restart, window, cx);
                                         }),
                                     )),
                             )
@@ -1686,10 +1781,10 @@ impl IncusManager {
             }
             "escape" => self.filter.clear(),
             _ => {
-                if let Some(ch) = keystroke.key_char.as_ref() {
-                    if ch.chars().all(|c| !c.is_control()) {
-                        self.filter.push_str(ch);
-                    }
+                if let Some(ch) = keystroke.key_char.as_ref()
+                    && ch.chars().all(|c| !c.is_control())
+                {
+                    self.filter.push_str(ch);
                 }
             }
         }
@@ -1811,9 +1906,9 @@ impl IncusManager {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .children(self.grouped.iter().cloned().map(|(project, vms)| {
+                    .children(self.grouped.iter().map(|(project, vms)| {
                         // A search implicitly expands, otherwise hits stay hidden.
-                        let collapsed = !filtering && self.collapsed.contains(&project);
+                        let collapsed = !filtering && self.collapsed.contains(project);
                         let project_for_click = project.clone();
 
                         div()
@@ -1857,7 +1952,7 @@ impl IncusManager {
                                     })),
                             )
                             .when(!collapsed, |el| {
-                                el.children(vms.into_iter().map(|vm| {
+                                el.children(vms.iter().map(|vm| {
                                     let is_active = self.active.as_ref() == Some(&vm.id);
                                     let is_open = self.is_open(&vm.id);
                                     let pending = self.connecting.contains(&vm.id);
@@ -1879,7 +1974,7 @@ impl IncusManager {
                                         .cursor_pointer()
                                         .when(is_active, |s| s.bg(theme::selected()))
                                         .hover(|s| s.bg(theme::hover()))
-                            .child(status_dot(running))
+                                        .child(status_dot(running))
                                         .child(
                                             div()
                                                 .flex_1()
@@ -1930,8 +2025,9 @@ impl IncusManager {
                                                     .child("▶")
                                                     .on_click(cx.listener(
                                                         move |state, _, window, cx| {
-                                                            state.start_vm(
+                                                            state.power_action(
                                                                 id_start.clone(),
+                                                                PowerAction::Start,
                                                                 window,
                                                                 cx,
                                                             );
@@ -2529,14 +2625,20 @@ fn main() {
                         current_remote: incus_remote::current_name().into(),
                         remote_switcher_open: false,
                         remote_epoch: 0,
+                        event_task: None,
                     };
                     state.refresh(window, cx);
                     state.start_event_listener(window, cx);
+                    state.start_refresh_watchdog(window, cx);
                     // Everything typed in this window is meant literally, not
                     // composed by an IME — see `input_source`.
                     cx.observe_window_activation(window, |_state, window, _cx| {
                         if window.is_window_active() {
                             input_source::switch_to_ascii_capable();
+                        } else {
+                            // Selecting a source is global, so leaving inm
+                            // has to hand the user's own IME back.
+                            input_source::restore();
                         }
                     })
                     .detach();
