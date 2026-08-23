@@ -33,6 +33,31 @@ const SCROLL_LINES_PER_NOTCH: f32 = 3.0;
 #[cfg(not(target_os = "linux"))]
 const SCROLL_LINES_PER_NOTCH: f32 = 1.0;
 
+/// How often the instance list is re-read even when the event stream has
+/// reported nothing — see [`IncusManager::start_refresh_watchdog`]. Long,
+/// because events carry the latency-sensitive updates; this only has to
+/// bound how long a *broken* stream can hide.
+const WATCHDOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How long to wait before redialling the event stream after it drops or
+/// fails to connect, and the ceiling that delay doubles up to while it keeps
+/// failing.
+const EVENT_RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
+const EVENT_RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+/// A stream that stayed connected at least this long counts as healthy, so
+/// the next reconnect starts from the short delay again.
+const EVENT_HEALTHY_AFTER: Duration = Duration::from_secs(60);
+
+/// What the event-stream reader hands the UI.
+enum ListChange {
+    /// One instance changed.
+    Event(incus::InstanceEvent),
+    /// The stream just (re)connected, so anything that happened while it was
+    /// down was missed and the list has to be re-read from scratch.
+    Resync,
+}
+
 mod theme {
     use gpui::{rgb, Rgba};
 
@@ -222,6 +247,11 @@ struct IncusManager {
     /// the previous remote knows to stop instead of reporting events for a
     /// remote that is no longer current.
     remote_epoch: u64,
+    /// Cancels the previous remote's event-stream reader. Dropping a tokio
+    /// `JoinHandle` only detaches it, so without this an listener parked on a
+    /// quiet remote's socket would live — and eventually *reconnect*, to
+    /// whichever remote is current by then — for the rest of the process.
+    event_task: Option<tokio::task::AbortHandle>,
 }
 
 impl IncusManager {
@@ -287,36 +317,60 @@ impl IncusManager {
     /// Keep the list fresh without the user having to press anything: an
     /// instance changing anywhere (created, started, stopped, deleted,
     /// renamed, ...) pushes a refresh over the daemon's own event stream, so
-    /// there is no polling interval to lag behind. `instance-created`
-    /// additionally surfaces a status-bar notice, since that one is easy to
-    /// otherwise miss in a scrolling list.
-    fn start_event_listener(&self, window: &mut Window, cx: &mut Context<Self>) {
+    /// the status dots do not lag a change made outside inm.
+    /// `instance-created` additionally surfaces a status-bar notice, since
+    /// that one is easy to otherwise miss in a scrolling list.
+    ///
+    /// [`start_refresh_watchdog`] still runs underneath: the event stream is
+    /// the fast path, not the only one.
+    fn start_event_listener(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let epoch = self.remote_epoch;
-        let (tx, mut rx) = futures::channel::mpsc::unbounded::<incus::InstanceEvent>();
+        let (tx, mut rx) = futures::channel::mpsc::unbounded::<ListChange>();
 
         // The websocket read loop lives entirely on the tokio runtime — same
         // split as the SPICE frame pump in `spice_session`, since gpui's own
-        // executor cannot poll a tokio I/O type directly. A dropped
-        // `JoinHandle` does not stop the task; it keeps forwarding events
-        // for the life of the process, or until `tx` has no more receivers.
-        spice_session::runtime().spawn(async move {
+        // executor cannot poll a tokio I/O type directly.
+        let task = spice_session::runtime().spawn(async move {
+            let mut backoff = EVENT_RECONNECT_BACKOFF;
             loop {
+                // A failure to connect is not reported here: the watchdog
+                // poll is what surfaces a daemon that cannot be reached.
                 if let Ok(mut ws) = incus::events_websocket().await {
+                    let connected_at = tokio::time::Instant::now();
+                    // Whatever happened while the stream was down was missed
+                    // outright, so a fresh connection starts by re-reading
+                    // the list rather than trusting what is on screen and
+                    // waiting for the next event.
+                    if tx.unbounded_send(ListChange::Resync).is_err() {
+                        return;
+                    }
                     while let Some(event) = incus::next_instance_event(&mut ws).await {
-                        if tx.unbounded_send(event).is_err() {
+                        if tx.unbounded_send(ListChange::Event(event)).is_err() {
                             return;
                         }
                     }
+                    // A stream that stayed up is a working one, however it
+                    // ended; only a connection that collapses immediately
+                    // should slow the next attempt down.
+                    if connected_at.elapsed() >= EVENT_HEALTHY_AFTER {
+                        backoff = EVENT_RECONNECT_BACKOFF;
+                    }
                 }
-                // The daemon doesn't support the endpoint, or the connection
-                // dropped — either way, back off instead of hot-looping.
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                // Without this, a daemon that accepts the upgrade and then
+                // drops the stream would have inm re-reading the whole list
+                // every few seconds, harder than the poll this replaced.
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(EVENT_RECONNECT_BACKOFF_MAX);
             }
         });
+        // Replaces (and cancels) whichever remote's listener was running.
+        if let Some(previous) = self.event_task.replace(task.abort_handle()) {
+            previous.abort();
+        }
 
         cx.spawn_in(window, async move |this, cx| {
             use futures::StreamExt;
-            while let Some(event) = rx.next().await {
+            while let Some(change) = rx.next().await {
                 let alive = this
                     .update_in(cx, |state, window, cx| {
                         // A newer listener has since taken over for a
@@ -324,9 +378,12 @@ impl IncusManager {
                         if state.remote_epoch != epoch {
                             return false;
                         }
-                        if event.action == "instance-created" {
-                            state.notice =
-                                Some(format!("已创建虚拟机 {}/{}", event.id.project, event.id.name).into());
+                        if let ListChange::Event(event) = &change
+                            && event.action == "instance-created"
+                        {
+                            state.notice = Some(
+                                format!("已创建虚拟机 {}/{}", event.id.project, event.id.name).into(),
+                            );
                             state.clear_notice_after(Duration::from_secs(5), window, cx);
                         }
                         state.refresh(window, cx);
@@ -334,6 +391,45 @@ impl IncusManager {
                         true
                     })
                     .unwrap_or(false);
+                if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// A slow poll underneath the event stream.
+    ///
+    /// Not redundant with it: a websocket can stop delivering without ever
+    /// erroring, and while [`incus::next_instance_event`] now pings to catch
+    /// that, the daemon can also be unreachable, mid-restart, or too old to
+    /// serve the endpoint at all. This is the path that both recovers the
+    /// list and surfaces *why* it is stale, so a broken event stream degrades
+    /// to the old polling behaviour instead of to a frozen sidebar.
+    fn start_refresh_watchdog(&self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(WATCHDOG_INTERVAL).await;
+                let result = spice_session::runtime()
+                    .spawn(incus::list_vms())
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()));
+                let alive = this
+                    .update(cx, |state, cx| {
+                        match result {
+                            Ok(vms) => {
+                                state.error = None;
+                                state.set_vms(vms);
+                            }
+                            // Keep whatever is on screen rather than blanking
+                            // it on a transient failure — just say why it is
+                            // stale.
+                            Err(msg) => state.error = Some(msg.into()),
+                        }
+                        cx.notify();
+                    })
+                    .is_ok();
                 if !alive {
                     break;
                 }
@@ -2529,14 +2625,20 @@ fn main() {
                         current_remote: incus_remote::current_name().into(),
                         remote_switcher_open: false,
                         remote_epoch: 0,
+                        event_task: None,
                     };
                     state.refresh(window, cx);
                     state.start_event_listener(window, cx);
+                    state.start_refresh_watchdog(window, cx);
                     // Everything typed in this window is meant literally, not
                     // composed by an IME — see `input_source`.
                     cx.observe_window_activation(window, |_state, window, _cx| {
                         if window.is_window_active() {
                             input_source::switch_to_ascii_capable();
+                        } else {
+                            // Selecting a source is global, so leaving inm
+                            // has to hand the user's own IME back.
+                            input_source::restore();
                         }
                     })
                     .detach();

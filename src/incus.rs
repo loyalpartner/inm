@@ -106,17 +106,55 @@ async fn request(method: &str, path: &str, body: Option<Value>) -> Result<Value,
     Ok(envelope)
 }
 
+/// How long a single `?timeout=` round on the daemon's wait endpoint runs
+/// before it hands the operation back in whatever state it is in.
+const WAIT_ROUND_SECS: u32 = 30;
+
+/// Give up on an operation that has not reached a terminal state after this
+/// long. Generous, because the wait covers a hard-stop fallback and a live
+/// migration as well as a plain start.
+const WAIT_TOTAL_ROUNDS: u32 = 10;
+
+/// Terminal operation `status_code`s (`shared/api.StatusCode` upstream);
+/// anything below `Success` is still in flight.
+const OP_SUCCESS: u64 = 200;
+
 /// Block until an async operation (start/stop/...) finishes. The console
 /// operation is the one exception — it stays running for the life of the
 /// session, so `spice_session` opens its websockets instead of waiting on it.
+///
+/// The daemon's `?timeout=` is a *polling* window, not a deadline: when it
+/// expires the operation comes back still `Running`, which is not a failure.
+/// Treating it as one used to report a bare "操作失败" for every stop of a VM
+/// that ignores ACPI — Incus waits `boot.host_shutdown_timeout` (30s by
+/// default) before force-stopping, so that case reliably outlived a single
+/// round while actually succeeding.
 async fn wait_operation(id: &str) -> Result<(), String> {
-    let envelope = request("GET", &format!("/1.0/operations/{id}/wait?timeout=30"), None).await?;
-    let status = envelope["metadata"]["status"].as_str().unwrap_or_default();
-    if status == "Success" {
-        return Ok(());
+    for _ in 0..WAIT_TOTAL_ROUNDS {
+        let envelope = request(
+            "GET",
+            &format!("/1.0/operations/{id}/wait?timeout={WAIT_ROUND_SECS}"),
+            None,
+        )
+        .await?;
+        let meta = &envelope["metadata"];
+        // Fall back to the textual status for a daemon old enough not to send
+        // `status_code`, so this cannot regress into an infinite wait there.
+        let code = meta["status_code"].as_u64().unwrap_or(match meta["status"].as_str() {
+            Some("Success") => OP_SUCCESS,
+            Some("Failure") | Some("Cancelled") => OP_SUCCESS + 1,
+            _ => 0,
+        });
+        if code == OP_SUCCESS {
+            return Ok(());
+        }
+        if code > OP_SUCCESS {
+            let detail = meta["err"].as_str().filter(|e| !e.is_empty()).unwrap_or("操作失败");
+            return Err(detail.to_string());
+        }
+        // Still running — go round again.
     }
-    let detail = envelope["metadata"]["err"].as_str().unwrap_or("操作失败");
-    Err(detail.to_string())
+    Err("操作仍在进行中，已停止等待".to_string())
 }
 
 /// Every virtual machine across every project, sorted by project then name.
@@ -371,8 +409,15 @@ pub async fn operation_websocket(
 /// events — instance created/started/stopped/deleted/renamed/... This is
 /// how the sidebar learns about a change someone else made (another
 /// terminal, another user) without waiting for the next poll.
+///
+/// `all-projects=true` is not optional: this endpoint is project-scoped, and
+/// a request that names neither a project nor all of them only ever receives
+/// the default project's events — while [`list_vms`] shows every project's
+/// instances. Without it, anything happening outside `default` silently
+/// never reaches the sidebar. (`incus monitor` makes the same call, and its
+/// own `--all-projects` flag maps to this parameter.)
 pub async fn events_websocket() -> Result<tokio_tungstenite::WebSocketStream<Connection>, String> {
-    connect_ws("/1.0/events?type=lifecycle").await
+    connect_ws("/1.0/events?type=lifecycle&all-projects=true").await
 }
 
 async fn connect_ws(path_and_query: &str) -> Result<tokio_tungstenite::WebSocketStream<Connection>, String> {
@@ -410,23 +455,52 @@ pub struct InstanceEvent {
     pub id: VmId,
 }
 
+/// No traffic at all for this long means a ping goes out; a second silent
+/// stretch after that means the connection is treated as dead.
+///
+/// A quiet cluster legitimately sends nothing for hours, so a plain read
+/// deadline would reconnect constantly. The ping is what distinguishes
+/// "nothing is happening" from "this socket is half-open" — a TCP connection
+/// dropped by a NAT/firewall idle timer or a sleeping laptop never returns
+/// an error, it just stops delivering, and the stream would otherwise stay
+/// parked on it forever with the sidebar frozen and nothing reported.
+const EVENT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Read events off the stream until one names an instance, or the stream
-/// itself ends — a dropped connection or a read error both surface as
-/// `None` here, since the caller's response to either is the same: back off
-/// and reconnect.
+/// itself ends — a dropped connection, a read error, and a silent half-open
+/// socket all surface as `None` here, since the caller's response to each is
+/// the same: back off and reconnect.
 pub async fn next_instance_event(
     ws: &mut tokio_tungstenite::WebSocketStream<Connection>,
 ) -> Option<InstanceEvent> {
-    use futures::StreamExt;
-    while let Some(Ok(msg)) = ws.next().await {
-        let tokio_tungstenite::tungstenite::Message::Text(text) = msg else {
-            continue;
-        };
-        if let Some(event) = parse_instance_event(&text) {
-            return Some(event);
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let mut awaiting_pong = false;
+    loop {
+        match tokio::time::timeout(EVENT_IDLE_TIMEOUT, ws.next()).await {
+            // Silent for one window. Probe once; a second silent window with
+            // the probe unanswered means the peer is gone.
+            Err(_elapsed) => {
+                if awaiting_pong {
+                    return None;
+                }
+                ws.send(Message::Ping(Default::default())).await.ok()?;
+                awaiting_pong = true;
+            }
+            Ok(None) | Ok(Some(Err(_))) => return None,
+            Ok(Some(Ok(msg))) => {
+                // Any frame at all proves the connection is alive, Pong
+                // included.
+                awaiting_pong = false;
+                if let Message::Text(text) = msg
+                    && let Some(event) = parse_instance_event(&text)
+                {
+                    return Some(event);
+                }
+            }
         }
     }
-    None
 }
 
 fn parse_instance_event(text: &str) -> Option<InstanceEvent> {
@@ -436,25 +510,134 @@ fn parse_instance_event(text: &str) -> Option<InstanceEvent> {
     }
     let metadata = &envelope["metadata"];
     let action = metadata["action"].as_str()?.to_string();
-    // e.g. "/1.0/instances/foo?project=bar" — project is omitted for the
-    // default project.
-    let path = metadata["source"].as_str()?.strip_prefix("/1.0/instances/")?;
-    let (name, project) = match path.split_once('?') {
-        Some((name, query)) => (
-            name,
-            query
-                .split('&')
-                .find_map(|kv| kv.strip_prefix("project="))
-                .unwrap_or("default"),
-        ),
-        None => (path, "default"),
+
+    // Daemons carrying the `event_lifecycle_name_and_project` extension put
+    // both directly in the metadata; prefer those over picking the `source`
+    // URL apart, and keep the parsing only as the fallback for older ones.
+    let named = |key: &str| metadata[key].as_str().filter(|v| !v.is_empty()).map(str::to_string);
+    let (name, project) = match (named("name"), named("project")) {
+        (Some(name), Some(project)) => (name, project),
+        _ => parse_instance_source(metadata["source"].as_str()?)?,
     };
-    let decode = |s: &str| percent_encoding::percent_decode_str(s).decode_utf8().ok().map(|c| c.into_owned());
+
     Some(InstanceEvent {
         action,
         id: VmId {
-            name: decode(name)?.into(),
-            project: decode(project)?.into(),
+            name: name.into(),
+            project: project.into(),
         },
     })
+}
+
+/// Pull (name, project) out of a lifecycle event's `source` URL — e.g.
+/// `/1.0/instances/foo?project=bar`, with the query omitted entirely for the
+/// default project.
+fn parse_instance_source(source: &str) -> Option<(String, String)> {
+    let path = source.strip_prefix("/1.0/instances/")?;
+    let (path, query) = match path.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (path, None),
+    };
+    // A snapshot or backup event's source continues past the instance
+    // (`.../foo/snapshots/snap0`); everything after the first segment names a
+    // sub-resource, not the instance this event is about.
+    let name = path.split('/').next().filter(|n| !n.is_empty())?;
+    let project = query
+        .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("project=")))
+        .unwrap_or("default");
+
+    // The path segment and the query value are escaped by different rules on
+    // the daemon side (`url.PathEscape` vs `url.Values.Encode`), and only the
+    // latter turns a space into `+`.
+    let decode_path = |s: &str| {
+        percent_encoding::percent_decode_str(s)
+            .decode_utf8()
+            .ok()
+            .map(|c| c.into_owned())
+    };
+    let decode_query = |s: &str| decode_path(&s.replace('+', "%20"));
+
+    Some((decode_path(name)?, decode_query(project)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lifecycle(metadata: serde_json::Value) -> String {
+        serde_json::json!({ "type": "lifecycle", "metadata": metadata }).to_string()
+    }
+
+    #[test]
+    fn structured_name_and_project_win_over_the_source_url() {
+        let event = parse_instance_event(&lifecycle(serde_json::json!({
+            "action": "instance-created",
+            "source": "/1.0/instances/stale?project=stale",
+            "name": "web1",
+            "project": "clientdev",
+        })))
+        .expect("an instance event");
+        assert_eq!(event.action, "instance-created");
+        assert_eq!(event.id.name.as_ref(), "web1");
+        assert_eq!(event.id.project.as_ref(), "clientdev");
+    }
+
+    #[test]
+    fn source_url_carries_a_non_default_project() {
+        let event = parse_instance_event(&lifecycle(serde_json::json!({
+            "action": "instance-started",
+            "source": "/1.0/instances/web1?project=clientdev",
+        })))
+        .expect("an instance event");
+        assert_eq!(event.id.name.as_ref(), "web1");
+        assert_eq!(event.id.project.as_ref(), "clientdev");
+    }
+
+    #[test]
+    fn source_url_without_a_query_means_the_default_project() {
+        let event = parse_instance_event(&lifecycle(serde_json::json!({
+            "action": "instance-stopped",
+            "source": "/1.0/instances/web1",
+        })))
+        .expect("an instance event");
+        assert_eq!(event.id.project.as_ref(), "default");
+    }
+
+    #[test]
+    fn a_snapshots_source_still_names_the_instance_itself() {
+        let event = parse_instance_event(&lifecycle(serde_json::json!({
+            "action": "instance-snapshot-created",
+            "source": "/1.0/instances/web1/snapshots/nightly",
+        })))
+        .expect("an instance event");
+        assert_eq!(event.id.name.as_ref(), "web1");
+    }
+
+    #[test]
+    fn escaped_names_decode_by_their_own_rules() {
+        // Path segments escape a space as %20, query values as `+`.
+        let event = parse_instance_event(&lifecycle(serde_json::json!({
+            "action": "instance-started",
+            "source": "/1.0/instances/my%20vm?project=my+project",
+        })))
+        .expect("an instance event");
+        assert_eq!(event.id.name.as_ref(), "my vm");
+        assert_eq!(event.id.project.as_ref(), "my project");
+    }
+
+    #[test]
+    fn non_instance_and_non_lifecycle_traffic_is_ignored() {
+        assert!(parse_instance_event(&lifecycle(serde_json::json!({
+            "action": "network-created",
+            "source": "/1.0/networks/br0",
+        })))
+        .is_none());
+
+        assert!(parse_instance_event(
+            &serde_json::json!({ "type": "logging", "metadata": { "message": "hi" } }).to_string()
+        )
+        .is_none());
+
+        assert!(parse_instance_event("not json at all").is_none());
+    }
 }
