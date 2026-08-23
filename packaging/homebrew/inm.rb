@@ -1,16 +1,19 @@
 # Copy this into <your-tap-repo>/Formula/inm.rb (class name must match the
-# filename in PascalCase — Inm for inm.rb). Bump `url`/`sha256` by hand for
-# each new release; there's no automation wired up for this one yet, unlike
-# the AUR package's release.yml.
+# filename in PascalCase — Inm for inm.rb).
 #
-# sha256 below is v0.1.0's GitHub-generated source tarball, already verified
-# against a fresh download (see packaging/aur/PKGBUILD.template's sha256sums
-# for the same tarball, at the same commit this was written).
+# 🔴 Bump `url`/`sha256` by hand for each new release. Nothing in release.yml
+# renders this the way it does packaging/aur/PKGBUILD.template, so it goes
+# stale silently — it sat on v0.1.0 through two releases before anyone
+# noticed, meaning `brew install` was shipping code two versions old.
+#
+# The sha256 is of the tag's GitHub-generated source tarball. Verified for
+# v0.3.1 against both a fresh download and the checksum release.yml computed
+# for the AUR package from the same tarball.
 class Inm < Formula
   desc "Native manager for Incus virtual machines with the SPICE console embedded"
   homepage "https://github.com/loyalpartner/inm"
-  url "https://github.com/loyalpartner/inm/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "67d17ce4cb4d033983639c708a30feb798dea6b5dc62c8a1980005c19f664ea1"
+  url "https://github.com/loyalpartner/inm/archive/refs/tags/v0.3.1.tar.gz"
+  sha256 "cc1ee60df2ba154688473eeade4665a4d1960a9087e26763de7bfc768eba615a"
   license "MIT"
 
   depends_on "pkg-config" => :build
