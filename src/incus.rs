@@ -24,10 +24,38 @@ pub struct VmId {
     pub name: SharedString,
 }
 
+/// An instance's run state, as the daemon reports it.
+///
+/// Worth a type rather than comparing `status` against `"Running"` at each
+/// call site: that test read every other state — including the two
+/// *transitional* ones — as "not running", so a machine mid-boot showed the
+/// same dead dot as a stopped one, with its ▶ button still offered.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    Running,
+    Stopped,
+    /// `Starting` or `Stopping`: on its way somewhere, and neither endpoint
+    /// is the truth yet.
+    Transitional,
+    /// `Frozen`, `Error`, or anything a future daemon adds.
+    Other,
+}
+
+impl Status {
+    fn parse(raw: &str) -> Self {
+        match raw {
+            "Running" => Status::Running,
+            "Stopped" => Status::Stopped,
+            "Starting" | "Stopping" => Status::Transitional,
+            _ => Status::Other,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Vm {
     pub id: VmId,
-    pub status: SharedString,
+    pub state: Status,
     /// Cluster member hosting this instance; empty when the daemon is not
     /// clustered. Shown in the sidebar so the fleet's layout is visible
     /// without opening each instance.
@@ -35,8 +63,15 @@ pub struct Vm {
 }
 
 impl Vm {
+    /// Whether the console can be opened and the stop/restart actions apply.
     pub fn running(&self) -> bool {
-        self.status.as_ref() == "Running"
+        self.state == Status::Running
+    }
+
+    /// Whether starting it is a thing the user can meaningfully ask for — false
+    /// while it is already on its way up or down.
+    pub fn startable(&self) -> bool {
+        matches!(self.state, Status::Stopped | Status::Other)
     }
 }
 
@@ -171,7 +206,7 @@ pub async fn list_vms() -> Result<Vec<Vm>, String> {
                 project: v.project.into(),
                 name: v.name.into(),
             },
-            status: v.status.into(),
+            state: Status::parse(&v.status),
             location: v.location.into(),
         })
         .collect();
@@ -566,6 +601,44 @@ mod tests {
 
     fn lifecycle(metadata: serde_json::Value) -> String {
         serde_json::json!({ "type": "lifecycle", "metadata": metadata }).to_string()
+    }
+
+    #[test]
+    fn transitional_states_are_neither_running_nor_startable() {
+        let vm = |raw: &str| Vm {
+            id: VmId { project: "p".into(), name: "n".into() },
+            state: Status::parse(raw),
+            location: "".into(),
+        };
+        // Mid-boot must not read as "off": it used to show the stopped dot
+        // and still offer ▶.
+        assert!(!vm("Starting").running());
+        assert!(!vm("Starting").startable());
+        assert!(!vm("Stopping").running());
+        assert!(!vm("Stopping").startable());
+
+        assert!(vm("Running").running());
+        assert!(!vm("Running").startable());
+        assert!(!vm("Stopped").running());
+        assert!(vm("Stopped").startable());
+    }
+
+    #[test]
+    fn an_unknown_state_stays_startable_rather_than_unusable() {
+        // Frozen/Error, or whatever a future daemon adds: better to offer the
+        // action and let the daemon refuse than to lock the row.
+        assert!(!vm_state("Frozen").0);
+        assert!(vm_state("Frozen").1);
+        assert!(vm_state("Weird").1);
+    }
+
+    fn vm_state(raw: &str) -> (bool, bool) {
+        let vm = Vm {
+            id: VmId { project: "p".into(), name: "n".into() },
+            state: Status::parse(raw),
+            location: "".into(),
+        };
+        (vm.running(), vm.startable())
     }
 
     #[test]

@@ -143,11 +143,13 @@ mod theme {
 }
 
 /// The running/stopped indicator shared by the sidebar and the palette.
-fn status_dot(running: bool) -> impl IntoElement {
-    div().size(px(6.0)).rounded_full().bg(if running {
-        theme::running()
-    } else {
-        theme::faint()
+/// The sidebar's run-state dot. A transitional instance gets its own colour
+/// rather than the stopped one — mid-boot is not "off".
+fn status_dot(state: incus::Status) -> impl IntoElement {
+    div().size(px(6.0)).rounded_full().bg(match state {
+        incus::Status::Running => theme::running(),
+        incus::Status::Transitional => theme::accent(),
+        incus::Status::Stopped | incus::Status::Other => theme::faint(),
     })
 }
 
@@ -1764,7 +1766,7 @@ impl IncusManager {
                             .cursor_pointer()
                             .when(is_selected, |s| s.bg(theme::selected()))
                             .hover(|s| s.bg(theme::hover()))
-                            .child(status_dot(running))
+                            .child(status_dot(vm.state))
                             .child(
                                 div()
                                     .flex_1()
@@ -2045,7 +2047,7 @@ impl IncusManager {
                                         .cursor_pointer()
                                         .when(is_active, |s| s.bg(theme::selected()))
                                         .hover(|s| s.bg(theme::hover()))
-                                        .child(status_dot(running))
+                                        .child(status_dot(vm.state))
                                         .child(
                                             div()
                                                 .flex_1()
@@ -2083,7 +2085,7 @@ impl IncusManager {
                                                     .child("●"),
                                             )
                                         })
-                                        .when(!running, |el| {
+                                        .when(vm.startable(), |el| {
                                             // Starting a VM is an explicit act,
                                             // so it gets its own control rather
                                             // than happening on row click.
