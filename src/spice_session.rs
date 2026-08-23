@@ -89,11 +89,19 @@ impl StartError {
 
 /// Input events sent from the UI thread into the SPICE session.
 pub enum InputEvent {
-    MouseMotion { x: i32, y: i32 },
-    MouseButton { button: i32, pressed: bool },
+    MouseMotion {
+        x: i32,
+        y: i32,
+    },
+    MouseButton {
+        button: i32,
+        pressed: bool,
+    },
     /// SPICE has no continuous wheel; each notch is a press+release of
     /// button 4 (up) or 5 (down), the X11 wheel-button convention.
-    MouseScroll { button: i32 },
+    MouseScroll {
+        button: i32,
+    },
     KeyPress(u32),
     KeyRelease(u32),
     Shutdown,
@@ -220,7 +228,11 @@ async fn pump_console_data(
             match local_read.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if ws_write.send(Message::Binary(buf[..n].to_vec().into())).await.is_err() {
+                    if ws_write
+                        .send(Message::Binary(buf[..n].to_vec().into()))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -319,7 +331,8 @@ async fn spawn_incus_console(
             let operation_id = operation_id.clone();
             let data_secret = data_secret.clone();
             let pump = tokio::spawn(async move {
-                if let Ok(ws) = crate::incus::operation_websocket(&operation_id, &data_secret).await {
+                if let Ok(ws) = crate::incus::operation_websocket(&operation_id, &data_secret).await
+                {
                     pump_console_data(conn, ws).await;
                 }
             });

@@ -38,7 +38,7 @@ pub fn restore() {}
 mod mac {
     use core_foundation_sys::array::{CFArrayGetCount, CFArrayGetValueAtIndex, CFArrayRef};
     use core_foundation_sys::base::{CFComparisonResult, CFRelease, CFTypeRef};
-    use core_foundation_sys::number::{CFBooleanGetValue, CFBooleanGetTypeID, CFBooleanRef};
+    use core_foundation_sys::number::{CFBooleanGetTypeID, CFBooleanGetValue, CFBooleanRef};
     use core_foundation_sys::string::{CFStringCompare, CFStringRef};
     use std::cell::Cell;
     use std::os::raw::c_void;
@@ -49,7 +49,8 @@ mod mac {
     #[link(name = "Carbon", kind = "framework")]
     unsafe extern "C" {
         fn TISCopyCurrentKeyboardInputSource() -> TisInputSourceRef;
-        fn TISCreateInputSourceList(properties: CFTypeRef, include_all_installed: u8) -> CFArrayRef;
+        fn TISCreateInputSourceList(properties: CFTypeRef, include_all_installed: u8)
+        -> CFArrayRef;
         fn TISSelectInputSource(input_source: TisInputSourceRef) -> i32;
         fn TISGetInputSourceProperty(
             input_source: TisInputSourceRef,

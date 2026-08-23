@@ -5,10 +5,10 @@ mod scancode;
 mod spice_session;
 
 use gpui::{
-    div, img, prelude::FluentBuilder, px, rgb, size, App, AppContext, Application, Bounds, Context,
-    InteractiveElement, IntoElement, MouseButton as GpuiMouseButton, ParentElement, PromptLevel,
-    Render, RenderImage, SharedString, StatefulInteractiveElement, Styled, StyledImage, Window,
-    WindowBounds, WindowOptions,
+    App, AppContext, Application, Bounds, Context, InteractiveElement, IntoElement,
+    MouseButton as GpuiMouseButton, ParentElement, PromptLevel, Render, RenderImage, SharedString,
+    StatefulInteractiveElement, Styled, StyledImage, Window, WindowBounds, WindowOptions, div, img,
+    prelude::FluentBuilder, px, rgb, size,
 };
 use incus::{Vm, VmId};
 use scancode::{
@@ -83,7 +83,7 @@ enum ListChange {
 }
 
 mod theme {
-    use gpui::{rgb, Rgba};
+    use gpui::{Rgba, rgb};
 
     pub fn bg() -> Rgba {
         rgb(0x1e1e1e)
@@ -137,7 +137,9 @@ mod theme {
             0x4fb0c6, // cyan
             0x9aa0a6, // grey
         ];
-        let hash = project.bytes().fold(0usize, |acc, b| acc.wrapping_mul(31).wrapping_add(b as usize));
+        let hash = project.bytes().fold(0usize, |acc, b| {
+            acc.wrapping_mul(31).wrapping_add(b as usize)
+        });
         rgb(PALETTE[hash % PALETTE.len()])
     }
 }
@@ -584,7 +586,8 @@ impl IncusManager {
     fn set_active(&mut self, id: Option<VmId>) {
         self.active = id;
         for tab in &self.tabs {
-            tab.handle.set_visible(self.active.as_ref() == Some(&tab.id));
+            tab.handle
+                .set_visible(self.active.as_ref() == Some(&tab.id));
         }
     }
 
@@ -828,11 +831,7 @@ impl IncusManager {
                         // Keep a project's tabs adjacent so groups stay
                         // contiguous, the way Chrome moves a tab into its
                         // group rather than leaving it stranded.
-                        match state
-                            .tabs
-                            .iter()
-                            .rposition(|t| t.id.project == id.project)
-                        {
+                        match state.tabs.iter().rposition(|t| t.id.project == id.project) {
                             Some(last) => state.tabs.insert(last + 1, tab),
                             None => state.tabs.push(tab),
                         }
@@ -847,7 +846,8 @@ impl IncusManager {
                         // Only the newest frame is worth painting; uploading
                         // every queued one just burns GPU time to show images
                         // that are already stale.
-                        #[allow(deprecated)] // try_recv returns Result<T, _>; this needs "is one ready?"
+                        #[allow(deprecated)]
+                        // try_recv returns Result<T, _>; this needs "is one ready?"
                         while let Ok(Some(newer)) = frames.try_next() {
                             image = newer;
                         }
@@ -1225,9 +1225,7 @@ impl IncusManager {
         // cycles down so holding Cmd and tapping P walks the list.
         if keystroke.modifiers.control || keystroke.modifiers.platform {
             match keystroke.key.as_str() {
-                "p" if keystroke.modifiers.control => {
-                    select(current.saturating_sub(1), palette)
-                }
+                "p" if keystroke.modifiers.control => select(current.saturating_sub(1), palette),
                 "n" if keystroke.modifiers.control => select((current + 1).min(last), palette),
                 // ⌘P again: wrap around rather than stopping at the bottom.
                 "p" => select(if current >= last { 0 } else { current + 1 }, palette),
@@ -1366,8 +1364,7 @@ impl IncusManager {
         } else {
             (left - SUBMENU_SIZE.0).max(0.0)
         };
-        let submenu_top =
-            power_row_top.min((f32::from(viewport.height) - SUBMENU_SIZE.1).max(0.0));
+        let submenu_top = power_row_top.min((f32::from(viewport.height) - SUBMENU_SIZE.1).max(0.0));
 
         // The menu and its flyout are two visually separate panels but must
         // share one hit-test region: `on_mouse_down_out` below fires on any
@@ -1501,13 +1498,22 @@ impl IncusManager {
                                     .flex()
                                     .flex_col()
                                     .child(item(
-                                        if running { "已在运行".into() } else { "启动".into() },
+                                        if running {
+                                            "已在运行".into()
+                                        } else {
+                                            "启动".into()
+                                        },
                                         "power-start",
                                         !running,
                                         false,
                                         Box::new(move |state, window, cx| {
                                             state.overlay = Overlay::None;
-                                            state.power_action(id_start.clone(), PowerAction::Start, window, cx);
+                                            state.power_action(
+                                                id_start.clone(),
+                                                PowerAction::Start,
+                                                window,
+                                                cx,
+                                            );
                                         }),
                                     ))
                                     .child(item(
@@ -1517,7 +1523,12 @@ impl IncusManager {
                                         false,
                                         Box::new(move |state, window, cx| {
                                             state.overlay = Overlay::None;
-                                            state.power_action(id_stop.clone(), PowerAction::Stop, window, cx);
+                                            state.power_action(
+                                                id_stop.clone(),
+                                                PowerAction::Stop,
+                                                window,
+                                                cx,
+                                            );
                                         }),
                                     ))
                                     .child(item(
@@ -1527,7 +1538,12 @@ impl IncusManager {
                                         false,
                                         Box::new(move |state, window, cx| {
                                             state.overlay = Overlay::None;
-                                            state.power_action(id_restart.clone(), PowerAction::Restart, window, cx);
+                                            state.power_action(
+                                                id_restart.clone(),
+                                                PowerAction::Restart,
+                                                window,
+                                                cx,
+                                            );
                                         }),
                                     )),
                             )
@@ -1644,12 +1660,7 @@ impl IncusManager {
                                 .py_2()
                                 .border_b_1()
                                 .border_color(theme::border())
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(theme::text())
-                                        .child("详细信息"),
-                                )
+                                .child(div().text_sm().text_color(theme::text()).child("详细信息"))
                                 .child(
                                     div()
                                         .id("close-details")
@@ -1691,9 +1702,11 @@ impl IncusManager {
                         .id("rename-dialog")
                         .track_focus(&self.rename_focus)
                         .key_context("Rename")
-                        .on_key_down(cx.listener(|state, event: &gpui::KeyDownEvent, window, cx| {
-                            state.handle_rename_key(&event.keystroke, window, cx);
-                        }))
+                        .on_key_down(cx.listener(
+                            |state, event: &gpui::KeyDownEvent, window, cx| {
+                                state.handle_rename_key(&event.keystroke, window, cx);
+                            },
+                        ))
                         .on_mouse_down_out(cx.listener(|state, _, window, cx| {
                             state.overlay = Overlay::None;
                             window.focus(&state.console_focus);
@@ -1769,9 +1782,11 @@ impl IncusManager {
                     .id("palette")
                     .track_focus(&self.palette_focus)
                     .key_context("Palette")
-                    .on_key_down(cx.listener(|state, event: &gpui::KeyDownEvent, window, cx| {
-                        state.handle_palette_key(&event.keystroke, window, cx);
-                    }))
+                    .on_key_down(
+                        cx.listener(|state, event: &gpui::KeyDownEvent, window, cx| {
+                            state.handle_palette_key(&event.keystroke, window, cx);
+                        }),
+                    )
                     .w(px(520.0))
                     .flex()
                     .flex_col()
@@ -1890,7 +1905,11 @@ impl IncusManager {
                             .py_1p5()
                             .text_sm()
                             .cursor_pointer()
-                            .text_color(if is_current { theme::accent() } else { theme::text() })
+                            .text_color(if is_current {
+                                theme::accent()
+                            } else {
+                                theme::text()
+                            })
                             .hover(|s| s.bg(theme::hover()))
                             .child(name)
                             .on_click(cx.listener(move |state, _, window, cx| {
@@ -2205,11 +2224,7 @@ impl IncusManager {
             // Group header: a coloured pill introducing the run of tabs.
             if current.as_ref() != Some(&project) {
                 current = Some(project.clone());
-                let members = self
-                    .tabs
-                    .iter()
-                    .filter(|t| t.id.project == project)
-                    .count();
+                let members = self.tabs.iter().filter(|t| t.id.project == project).count();
                 let project_for_click = project.clone();
 
                 rows.push(
@@ -2253,7 +2268,8 @@ impl IncusManager {
             let id_focus = tab.id.clone();
             let id_close = tab.id.clone();
             // Hold Cmd and every tab shows the number that selects it.
-            let badge = (self.held_modifiers.platform && index < 9).then(|| format!("⌘{}", index + 1));
+            let badge =
+                (self.held_modifiers.platform && index < 9).then(|| format!("⌘{}", index + 1));
 
             rows.push(
                 div()
@@ -2269,7 +2285,11 @@ impl IncusManager {
                     // The group colour rides along the top edge, so a tab is
                     // readable as "part of that group" at a glance.
                     .border_t_2()
-                    .border_color(if is_active { color } else { theme::tint(color, 0.35) })
+                    .border_color(if is_active {
+                        color
+                    } else {
+                        theme::tint(color, 0.35)
+                    })
                     .when(is_active, |s| s.bg(theme::bg()))
                     .when(!is_active, |s| s.hover(|s| s.bg(theme::hover())))
                     .when_some(badge, |el, badge| {
@@ -2377,29 +2397,29 @@ impl IncusManager {
                             .h_full()
                             .flex_shrink_0()
                             .cursor_pointer()
-                    // Drawn rather than typed: a glyph would sit at whatever
-                    // weight the system font decides, which never matches a
-                    // flat UI. This is a panel outline with its left column
-                    // filled — solid when the sidebar is showing.
-                    .child(
-                        div()
-                            .w(px(15.0))
-                            .h(px(12.0))
-                            .rounded_sm()
-                            .border_1()
-                            .border_color(if self.sidebar_visible {
-                                theme::dim()
-                            } else {
-                                theme::faint()
-                            })
-                            .flex()
-                            .flex_row()
-                            .child(div().w(px(4.0)).h_full().bg(if self.sidebar_visible {
-                                theme::dim()
-                            } else {
-                                theme::faint()
-                            })),
-                    )
+                            // Drawn rather than typed: a glyph would sit at whatever
+                            // weight the system font decides, which never matches a
+                            // flat UI. This is a panel outline with its left column
+                            // filled — solid when the sidebar is showing.
+                            .child(
+                                div()
+                                    .w(px(15.0))
+                                    .h(px(12.0))
+                                    .rounded_sm()
+                                    .border_1()
+                                    .border_color(if self.sidebar_visible {
+                                        theme::dim()
+                                    } else {
+                                        theme::faint()
+                                    })
+                                    .flex()
+                                    .flex_row()
+                                    .child(div().w(px(4.0)).h_full().bg(if self.sidebar_visible {
+                                        theme::dim()
+                                    } else {
+                                        theme::faint()
+                                    })),
+                            )
                             .hover(|s| s.bg(theme::hover()))
                             .on_click(cx.listener(|state, _, _, cx| {
                                 state.sidebar_visible = !state.sidebar_visible;
@@ -2419,26 +2439,28 @@ impl IncusManager {
             .id("console-surface")
             .track_focus(&self.console_focus)
             .key_context("SpiceConsole")
-            .on_key_down(cx.listener(|state, event: &gpui::KeyDownEvent, window, cx| {
-                // Escape closes whatever overlay is on top. It has to be
-                // checked here rather than in handle_shortcut, which only ever
-                // runs for Cmd-modified keys — a bare Escape would otherwise
-                // sail past and get typed into the guest instead.
-                if event.keystroke.key == "escape" && state.dismiss_overlay(window) {
-                    cx.notify();
-                    return;
-                }
-                // Anything held with Cmd belongs to the app, whether or not it
-                // maps to a shortcut. Forwarding the press but then swallowing
-                // the release (which is what happens when the guard is on the
-                // *release* side) wedges the key down in the guest.
-                if event.keystroke.modifiers.platform {
-                    state.consumed_keys.insert(event.keystroke.key.clone());
-                    state.handle_shortcut(&event.keystroke, window, cx);
-                    return;
-                }
-                state.send_key(&event.keystroke, true);
-            }))
+            .on_key_down(
+                cx.listener(|state, event: &gpui::KeyDownEvent, window, cx| {
+                    // Escape closes whatever overlay is on top. It has to be
+                    // checked here rather than in handle_shortcut, which only ever
+                    // runs for Cmd-modified keys — a bare Escape would otherwise
+                    // sail past and get typed into the guest instead.
+                    if event.keystroke.key == "escape" && state.dismiss_overlay(window) {
+                        cx.notify();
+                        return;
+                    }
+                    // Anything held with Cmd belongs to the app, whether or not it
+                    // maps to a shortcut. Forwarding the press but then swallowing
+                    // the release (which is what happens when the guard is on the
+                    // *release* side) wedges the key down in the guest.
+                    if event.keystroke.modifiers.platform {
+                        state.consumed_keys.insert(event.keystroke.key.clone());
+                        state.handle_shortcut(&event.keystroke, window, cx);
+                        return;
+                    }
+                    state.send_key(&event.keystroke, true);
+                }),
+            )
             .on_key_up(cx.listener(|state, event: &gpui::KeyUpEvent, _, _| {
                 // Release only what we actually pressed. Matching on the key
                 // rather than on the current modifiers keeps the pair balanced
@@ -2481,11 +2503,11 @@ impl IncusManager {
                         .gap_2()
                         .items_center()
                         .justify_center()
-                        .child(
-                            div()
-                                .text_color(theme::dim())
-                                .child(if connecting { "正在连接…" } else { "选择一台虚拟机" }),
-                        )
+                        .child(div().text_color(theme::dim()).child(if connecting {
+                            "正在连接…"
+                        } else {
+                            "选择一台虚拟机"
+                        }))
                         .when(!connecting, |el| {
                             el.child(
                                 div()
@@ -2660,16 +2682,18 @@ impl Render for IncusManager {
             .flex_col()
             .size_full()
             .bg(theme::bg())
-            .on_modifiers_changed(cx.listener(|state, event: &gpui::ModifiersChangedEvent, _, cx| {
-                // The Cmd badges on tabs are driven by this same state, so a
-                // change in it is exactly when the tab bar needs repainting.
-                let had_cmd = state.held_modifiers.platform;
-                state.sync_modifiers(event.modifiers);
-                state.sync_capslock(event.capslock);
-                if had_cmd != event.modifiers.platform {
-                    cx.notify();
-                }
-            }))
+            .on_modifiers_changed(cx.listener(
+                |state, event: &gpui::ModifiersChangedEvent, _, cx| {
+                    // The Cmd badges on tabs are driven by this same state, so a
+                    // change in it is exactly when the tab bar needs repainting.
+                    let had_cmd = state.held_modifiers.platform;
+                    state.sync_modifiers(event.modifiers);
+                    state.sync_capslock(event.capslock);
+                    if had_cmd != event.modifiers.platform {
+                        cx.notify();
+                    }
+                },
+            ))
             .child(self.render_tab_bar(cx))
             .child(
                 div()
