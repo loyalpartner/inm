@@ -107,14 +107,67 @@ pub enum InputEvent {
     Shutdown,
 }
 
-pub struct ConsoleHandle {
-    input: std_mpsc::Sender<InputEvent>,
-    /// Set when a frame has been handed to the UI and not yet painted.
-    frame_in_flight: Arc<AtomicBool>,
-    /// Live pointer mode, so the UI can tell absolute from relative.
-    mouse_mode: Arc<AtomicI32>,
+/// The two flags that pace frame production, kept together because they are
+/// only ever correct when reasoned about as a pair.
+///
+/// Producing a frame is a ~4MB surface conversion plus a full-screen texture
+/// upload, so it happens only when the console is on screen *and* the UI is
+/// not still holding the last frame. `in_flight` is the half that bites: it
+/// is set by the producer and cleared by the UI, which means a frame that
+/// reaches the UI without provoking a repaint leaves it set forever and the
+/// producer never builds another — a permanently black console.
+#[derive(Clone)]
+pub struct FrameBudget {
     /// Whether this console is the one on screen.
     visible: Arc<AtomicBool>,
+    /// Set when a frame has been handed to the UI and not yet painted.
+    in_flight: Arc<AtomicBool>,
+}
+
+impl FrameBudget {
+    /// A console starts visible: it is opened because the user wants to see it.
+    fn new() -> Self {
+        Self {
+            visible: Arc::new(AtomicBool::new(true)),
+            in_flight: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Whether the producer may build a frame right now.
+    fn may_produce(&self) -> bool {
+        self.visible.load(Ordering::Relaxed) && !self.in_flight.load(Ordering::Relaxed)
+    }
+
+    /// A frame has been handed over and is not painted yet.
+    fn took_frame(&self) {
+        self.in_flight.store(true, Ordering::Relaxed);
+    }
+
+    /// The UI has painted what it was given.
+    fn painted(&self) {
+        self.in_flight.store(false, Ordering::Relaxed);
+    }
+
+    /// Hidden consoles stop converting: a 1280x800 surface would otherwise
+    /// cost that copy up to 60 times a second for pixels nobody sees.
+    ///
+    /// Coming back on screen also cancels any outstanding debt — whatever the
+    /// UI was still owed a paint for is stale now, and leaving `in_flight` set
+    /// would stop the producer from building the fresh frame this console is
+    /// about to need.
+    fn set_visible(&self, visible: bool) {
+        if visible {
+            self.painted();
+        }
+        self.visible.store(visible, Ordering::Relaxed);
+    }
+}
+
+pub struct ConsoleHandle {
+    input: std_mpsc::Sender<InputEvent>,
+    budget: FrameBudget,
+    /// Live pointer mode, so the UI can tell absolute from relative.
+    mouse_mode: Arc<AtomicI32>,
     _proxy: ConsoleProxy,
 }
 
@@ -126,14 +179,11 @@ impl ConsoleHandle {
     /// Called once the UI has painted the frame it was given, releasing the
     /// producer to build the next one.
     pub fn frame_painted(&self) {
-        self.frame_in_flight.store(false, Ordering::Relaxed);
+        self.budget.painted();
     }
 
-    /// Background tabs stay connected but stop converting frames: a hidden
-    /// 1280x800 console would otherwise cost a 4MB copy up to 60 times a
-    /// second for pixels nobody sees.
     pub fn set_visible(&self, visible: bool) {
-        self.visible.store(visible, Ordering::Relaxed);
+        self.budget.set_visible(visible);
     }
 
     /// True once the guest agent has enabled absolute pointer positioning.
@@ -413,9 +463,8 @@ fn primary_to_image(display: &DisplayChannel) -> Option<Arc<RenderImage>> {
 /// A request to create a session, handed to the shared GLib thread.
 struct SessionRequest {
     socket: PathBuf,
-    frame_in_flight: Arc<AtomicBool>,
+    budget: FrameBudget,
     mouse_mode: Arc<AtomicI32>,
-    visible: Arc<AtomicBool>,
     frames: mpsc::UnboundedSender<Arc<RenderImage>>,
     inputs: std_mpsc::Receiver<InputEvent>,
     ready: std_mpsc::Sender<Result<(), String>>,
@@ -510,17 +559,13 @@ fn build_session(req: SessionRequest) -> Result<(), String> {
         let dirty = dirty.clone();
         let alive = alive.clone();
         let frames = req.frames;
-        let visible = req.visible;
-        let in_flight = req.frame_in_flight;
+        let budget = req.budget;
         glib::source::timeout_add_local(frame_interval(), move || {
             if !alive.get() {
                 return glib::ControlFlow::Break;
             }
             // Leave `dirty` set while hidden, so becoming visible again paints
             // the current screen on the very next tick.
-            if !visible.load(Ordering::Relaxed) {
-                return glib::ControlFlow::Continue;
-            }
             // Backpressure: never build a frame while the UI still owes us a
             // paint for the last one. Producing at a fixed rate regardless
             // makes the renderer allocate and upload a full-screen texture per
@@ -529,13 +574,13 @@ fn build_session(req: SessionRequest) -> Result<(), String> {
             // the paint adapts to whatever the GPU can actually sustain —
             // 60fps on Metal, less on a slow Vulkan path — with no magic
             // number to tune.
-            if in_flight.load(Ordering::Relaxed) {
+            if !budget.may_produce() {
                 return glib::ControlFlow::Continue;
             }
             if dirty.replace(false) {
                 match display_channel.borrow().as_ref().and_then(primary_to_image) {
                     Some(image) => {
-                        in_flight.store(true, Ordering::Relaxed);
+                        budget.took_frame();
                         if frames.unbounded_send(image).is_err() {
                             alive.set(false);
                             return glib::ControlFlow::Break;
@@ -683,16 +728,13 @@ pub async fn start_console(
     let (input_tx, input_rx) = std_mpsc::channel();
     let (ready_tx, ready_rx) = std_mpsc::channel();
     let mouse_mode = Arc::new(AtomicI32::new(MOUSE_MODE_SERVER));
-    // A console starts visible: it is opened because the user wants to see it.
-    let visible = Arc::new(AtomicBool::new(true));
-    let frame_in_flight = Arc::new(AtomicBool::new(false));
+    let budget = FrameBudget::new();
 
     session_requests()
         .send(SessionRequest {
             socket,
-            frame_in_flight: frame_in_flight.clone(),
+            budget: budget.clone(),
             mouse_mode: mouse_mode.clone(),
-            visible: visible.clone(),
             frames: frame_tx,
             inputs: input_rx,
             ready: ready_tx,
@@ -714,11 +756,79 @@ pub async fn start_console(
     Ok((
         ConsoleHandle {
             input: input_tx,
-            frame_in_flight,
+            budget,
             mouse_mode,
-            visible,
             _proxy: proxy,
         },
         frame_rx,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FrameBudget;
+
+    #[test]
+    fn a_fresh_console_may_produce_immediately() {
+        assert!(FrameBudget::new().may_produce());
+    }
+
+    #[test]
+    fn a_frame_in_flight_blocks_the_next_one_until_it_is_painted() {
+        let budget = FrameBudget::new();
+        budget.took_frame();
+        assert!(!budget.may_produce(), "还欠一次绘制时不该再产帧");
+        budget.painted();
+        assert!(budget.may_produce());
+    }
+
+    #[test]
+    fn a_hidden_console_produces_nothing() {
+        let budget = FrameBudget::new();
+        budget.set_visible(false);
+        assert!(!budget.may_produce());
+    }
+
+    /// The black-console regression.
+    ///
+    /// A frame that reached the UI without provoking a repaint left
+    /// `in_flight` set with nothing able to clear it, so the producer stopped
+    /// for good. Coming back on screen has to cancel that debt — otherwise
+    /// the console stays black even once it is the tab being looked at.
+    #[test]
+    fn becoming_visible_again_clears_a_frame_that_was_never_painted() {
+        let budget = FrameBudget::new();
+        budget.took_frame();
+        budget.set_visible(false);
+        budget.set_visible(true);
+        assert!(
+            budget.may_produce(),
+            "重新显示后必须能继续产帧，否则控制台永远黑屏"
+        );
+    }
+
+    #[test]
+    fn hiding_does_not_forgive_an_unpainted_frame() {
+        // Only *becoming visible* cancels the debt; going away must not, or a
+        // frame the UI is genuinely still holding would be double-counted.
+        let budget = FrameBudget::new();
+        budget.took_frame();
+        budget.set_visible(false);
+        budget.set_visible(true);
+        budget.took_frame();
+        assert!(!budget.may_produce());
+    }
+
+    /// Both halves are `Arc`, so the producer's clone and the UI's clone have
+    /// to be looking at the same flags — a `#[derive(Clone)]` that deep-copied
+    /// them would make every test above pass and the app still hang.
+    #[test]
+    fn clones_share_state() {
+        let producer = FrameBudget::new();
+        let ui = producer.clone();
+        producer.took_frame();
+        assert!(!ui.may_produce());
+        ui.painted();
+        assert!(producer.may_produce());
+    }
 }
