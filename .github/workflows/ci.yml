@@ -45,7 +45,12 @@ jobs:
             libvulkan-dev \
             libasound2-dev libfontconfig-dev libssl-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned, not `stable`. With `-D warnings`, a floating toolchain turns
+      # every Rust release into a possible red PR that has nothing to do with
+      # the change under review — 1.98 added `manual_chunks`, which failed a
+      # branch that passed clippy locally on 1.97. Bumping this is a
+      # deliberate one-line commit that carries any new lint fixes with it.
+      - uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: clippy
 
