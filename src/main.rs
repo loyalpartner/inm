@@ -196,6 +196,56 @@ struct Palette {
     selected: Option<VmId>,
 }
 
+/// The menu or dialog currently up.
+///
+/// One field rather than six independent `Option`/`bool`s, because these are
+/// mutually exclusive and were not being treated as such: "context menu and
+/// rename dialog both open" was representable, closing one meant remembering
+/// to clear the right field at 14 different call sites, and `dismiss_overlay`
+/// silently forgot the remote switcher — so Escape closed every overlay
+/// except that one. As a single enum, dismissal is an exhaustive `match` and
+/// a new variant cannot be forgotten.
+#[derive(Default)]
+enum Overlay {
+    #[default]
+    None,
+    /// Right-click menu: which instance, where to draw it, and whether its
+    /// 电源 flyout (启动/停止/重启) is open — a sub-state of this menu, not a
+    /// peer of it.
+    ContextMenu {
+        id: VmId,
+        at: gpui::Point<gpui::Pixels>,
+        power_menu_open: bool,
+    },
+    /// Details dialog: the instance, and its data once it has loaded.
+    Details {
+        id: VmId,
+        data: Box<Option<incus::VmDetails>>,
+    },
+    /// Rename dialog: the instance being renamed and the name being typed.
+    Rename { id: VmId, draft: String },
+    /// Quick-open palette (⌘P).
+    Palette(Palette),
+    /// The sidebar header's remote list.
+    RemoteSwitcher,
+}
+
+impl Overlay {
+    fn palette(&self) -> Option<&Palette> {
+        match self {
+            Overlay::Palette(palette) => Some(palette),
+            _ => None,
+        }
+    }
+
+    fn palette_mut(&mut self) -> Option<&mut Palette> {
+        match self {
+            Overlay::Palette(palette) => Some(palette),
+            _ => None,
+        }
+    }
+}
+
 /// Last laid-out bounds of the console element, recorded during paint so
 /// mouse events can be mapped from window space into guest space.
 #[derive(Clone, Default)]
@@ -232,17 +282,9 @@ struct IncusManager {
     consumed_keys: std::collections::HashSet<String>,
     /// Tab groups (by project) the user folded away.
     collapsed_groups: Vec<SharedString>,
-    /// Open right-click menu: which instance, and where to draw it.
-    context_menu: Option<(VmId, gpui::Point<gpui::Pixels>)>,
-    /// Whether the context menu's "电源" flyout (启动/停止/重启) is open.
-    power_menu_open: bool,
-    /// Details dialog: the instance, and its data once it has loaded.
-    details: Option<(VmId, Option<incus::VmDetails>)>,
-    /// Rename dialog: the instance being renamed and the name being typed.
-    rename: Option<(VmId, String)>,
+    /// Whichever menu or dialog is up, if any.
+    overlay: Overlay,
     rename_focus: gpui::FocusHandle,
-    /// Quick-open palette (⌘P): query plus the highlighted row.
-    palette: Option<Palette>,
     palette_focus: gpui::FocusHandle,
     /// Frames whose GPU texture must not be destroyed yet.
     ///
@@ -266,7 +308,6 @@ struct IncusManager {
     /// Which remote is currently active — starts at `config.yml`'s
     /// `default-remote`, changeable from the sidebar header.
     current_remote: SharedString,
-    remote_switcher_open: bool,
     /// Bumped on every remote switch so a still-running event listener from
     /// the previous remote knows to stop instead of reporting events for a
     /// remote that is no longer current.
@@ -331,7 +372,6 @@ impl IncusManager {
         self.error = None;
         self.notice = None;
         self.current_remote = name;
-        self.remote_switcher_open = false;
         self.remote_epoch += 1;
         self.refresh(window, cx);
         self.start_event_listener(window, cx);
@@ -488,21 +528,28 @@ impl IncusManager {
         }
     }
 
-    /// Close the topmost overlay, if any. Returns whether something closed.
+    /// Close whatever overlay is up. Returns whether something closed.
+    ///
+    /// Exhaustive on purpose: the old six-field version was missing the
+    /// remote switcher, so Escape closed everything except that one menu.
     fn dismiss_overlay(&mut self, window: &mut Window) -> bool {
-        if self.context_menu.take().is_some() {
-            return true;
+        match std::mem::take(&mut self.overlay) {
+            Overlay::None => false,
+            // Menus dismiss without disturbing focus; dialogs took it, so
+            // they hand it back to the console.
+            Overlay::ContextMenu { .. } | Overlay::RemoteSwitcher => true,
+            Overlay::Details { .. } | Overlay::Rename { .. } | Overlay::Palette(_) => {
+                window.focus(&self.console_focus);
+                true
+            }
         }
-        if self.details.take().is_some() || self.rename.take().is_some() {
-            window.focus(&self.console_focus);
-            return true;
-        }
-        false
     }
 
     fn begin_rename(&mut self, id: VmId, window: &mut Window, cx: &mut Context<Self>) {
-        self.context_menu = None;
-        self.rename = Some((id.clone(), id.name.to_string()));
+        self.overlay = Overlay::Rename {
+            draft: id.name.to_string(),
+            id,
+        };
         window.focus(&self.rename_focus);
         cx.notify();
     }
@@ -513,21 +560,21 @@ impl IncusManager {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((id, name)) = self.rename.as_mut() else {
+        let Overlay::Rename { id, draft } = &mut self.overlay else {
             return;
         };
         match keystroke.key.as_str() {
             "escape" => {
-                self.rename = None;
+                self.overlay = Overlay::None;
                 window.focus(&self.console_focus);
             }
             "backspace" => {
-                name.pop();
+                draft.pop();
             }
             "enter" => {
-                let (id, name) = (id.clone(), name.trim().to_string());
+                let (id, name) = (id.clone(), draft.trim().to_string());
                 if name.is_empty() || name == id.name.as_ref() {
-                    self.rename = None;
+                    self.overlay = Overlay::None;
                     window.focus(&self.console_focus);
                 } else {
                     self.commit_rename(id, name, window, cx);
@@ -537,7 +584,7 @@ impl IncusManager {
                 if let Some(ch) = keystroke.key_char.as_ref()
                     && ch.chars().all(|c| !c.is_control())
                 {
-                    name.push_str(ch);
+                    draft.push_str(ch);
                 }
             }
         }
@@ -551,7 +598,7 @@ impl IncusManager {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.rename = None;
+        self.overlay = Overlay::None;
         window.focus(&self.console_focus);
         cx.notify();
 
@@ -574,8 +621,10 @@ impl IncusManager {
     }
 
     fn show_details(&mut self, id: VmId, window: &mut Window, cx: &mut Context<Self>) {
-        self.context_menu = None;
-        self.details = Some((id.clone(), None));
+        self.overlay = Overlay::Details {
+            id: id.clone(),
+            data: Box::new(None),
+        };
         cx.notify();
 
         cx.spawn_in(window, async move |this, cx| {
@@ -585,19 +634,23 @@ impl IncusManager {
                 .await
                 .unwrap_or_else(|e| Err(e.to_string()));
             this.update(cx, |state, cx| {
+                // Only act if the dialog is still showing this VM — the user
+                // may have closed it or opened another meanwhile, and a slow
+                // failure for VM A must not close the dialog they have since
+                // opened for VM B.
+                let showing_this_vm =
+                    matches!(&state.overlay, Overlay::Details { id: shown, .. } if shown == &id);
                 match result {
-                    // Only fill in if the dialog is still showing this VM —
-                    // the user may have closed it or opened another meanwhile.
-                    Ok(details) if state.details.as_ref().is_some_and(|(d, _)| d == &id) => {
-                        state.details = Some((id.clone(), Some(details)));
+                    Ok(details) if showing_this_vm => {
+                        state.overlay = Overlay::Details {
+                            id: id.clone(),
+                            data: Box::new(Some(details)),
+                        };
                     }
                     Ok(_) => {}
                     Err(msg) => {
-                        // Same identity guard as the success arm: a slow
-                        // failure for VM A must not close the dialog the user
-                        // has since opened for VM B.
-                        if state.details.as_ref().is_some_and(|(d, _)| d == &id) {
-                            state.details = None;
+                        if showing_this_vm {
+                            state.overlay = Overlay::None;
                         }
                         state.error = Some(msg.into());
                     }
@@ -1048,7 +1101,7 @@ impl IncusManager {
     }
 
     fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.palette = Some(Palette {
+        self.overlay = Overlay::Palette(Palette {
             query: String::new(),
             selected: None,
         });
@@ -1057,7 +1110,7 @@ impl IncusManager {
     }
 
     fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.palette = None;
+        self.overlay = Overlay::None;
         window.focus(&self.console_focus);
         cx.notify();
     }
@@ -1065,7 +1118,7 @@ impl IncusManager {
     /// Rows shown in the palette: every VM whose project or name contains the
     /// query, running ones first so the common case is one keystroke away.
     fn palette_matches(&self) -> Vec<Vm> {
-        let Some(palette) = &self.palette else {
+        let Some(palette) = self.overlay.palette() else {
             return Vec::new();
         };
         let needle = palette.query.to_lowercase();
@@ -1091,7 +1144,7 @@ impl IncusManager {
         cx: &mut Context<Self>,
     ) {
         let matches = self.palette_matches();
-        let Some(palette) = self.palette.as_mut() else {
+        let Some(palette) = self.overlay.palette_mut() else {
             return;
         };
 
@@ -1172,10 +1225,17 @@ impl IncusManager {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
-        let (id, position) = self.context_menu.clone()?;
+        let Overlay::ContextMenu {
+            id,
+            at: position,
+            power_menu_open,
+        } = &self.overlay
+        else {
+            return None;
+        };
+        let (id, position, power_menu_open) = (id.clone(), *position, *power_menu_open);
         let vm = self.vms.iter().find(|v| v.id == id)?.clone();
         let running = vm.running();
-        let power_menu_open = self.power_menu_open;
 
         // `closes_power_menu` is set for every top-level item except "电源"
         // itself, so hovering a sibling closes its flyout the way a native
@@ -1199,8 +1259,13 @@ impl IncusManager {
                 .child(label)
                 .when(closes_power_menu, |s| {
                     s.on_hover(cx.listener(|state, hovered: &bool, _, cx| {
-                        if *hovered && state.power_menu_open {
-                            state.power_menu_open = false;
+                        if *hovered
+                            && let Overlay::ContextMenu {
+                                power_menu_open: open @ true,
+                                ..
+                            } = &mut state.overlay
+                        {
+                            *open = false;
                             cx.notify();
                         }
                     }))
@@ -1278,7 +1343,7 @@ impl IncusManager {
                         // that precedes an item's click, so the item's action
                         // would never run.
                         .on_mouse_down_out(cx.listener(|state, _, _, cx| {
-                            state.context_menu = None;
+                            state.overlay = Overlay::None;
                             cx.notify();
                         }))
                         .absolute()
@@ -1306,7 +1371,7 @@ impl IncusManager {
                                     running,
                                     true,
                                     Box::new(move |state, window, cx| {
-                                        state.context_menu = None;
+                                        state.overlay = Overlay::None;
                                         state.open_or_focus(id_console.clone(), window, cx);
                                     }),
                                 ))
@@ -1325,8 +1390,13 @@ impl IncusManager {
                                         .child("电源")
                                         .child(div().text_color(theme::faint()).child("▸"))
                                         .on_hover(cx.listener(|state, hovered: &bool, _, cx| {
-                                            if *hovered && !state.power_menu_open {
-                                                state.power_menu_open = true;
+                                            if *hovered
+                                                && let Overlay::ContextMenu {
+                                                    power_menu_open: open @ false,
+                                                    ..
+                                                } = &mut state.overlay
+                                            {
+                                                *open = true;
                                                 cx.notify();
                                             }
                                         })),
@@ -1376,8 +1446,7 @@ impl IncusManager {
                                         !running,
                                         false,
                                         Box::new(move |state, window, cx| {
-                                            state.context_menu = None;
-                                            state.power_menu_open = false;
+                                            state.overlay = Overlay::None;
                                             state.power_action(id_start.clone(), PowerAction::Start, window, cx);
                                         }),
                                     ))
@@ -1387,8 +1456,7 @@ impl IncusManager {
                                         running,
                                         false,
                                         Box::new(move |state, window, cx| {
-                                            state.context_menu = None;
-                                            state.power_menu_open = false;
+                                            state.overlay = Overlay::None;
                                             state.power_action(id_stop.clone(), PowerAction::Stop, window, cx);
                                         }),
                                     ))
@@ -1398,8 +1466,7 @@ impl IncusManager {
                                         running,
                                         false,
                                         Box::new(move |state, window, cx| {
-                                            state.context_menu = None;
-                                            state.power_menu_open = false;
+                                            state.overlay = Overlay::None;
                                             state.power_action(id_restart.clone(), PowerAction::Restart, window, cx);
                                         }),
                                     )),
@@ -1410,7 +1477,10 @@ impl IncusManager {
     }
 
     fn render_details(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let (id, details) = self.details.as_ref()?;
+        let Overlay::Details { id, data } = &self.overlay else {
+            return None;
+        };
+        let details = data.as_ref();
 
         let row = |label: &'static str, value: String| {
             div()
@@ -1494,7 +1564,7 @@ impl IncusManager {
                     div()
                         .id("details-dialog")
                         .on_mouse_down_out(cx.listener(|state, _, _, cx| {
-                            state.details = None;
+                            state.overlay = Overlay::None;
                             cx.notify();
                         }))
                         .w(px(420.0))
@@ -1529,7 +1599,7 @@ impl IncusManager {
                                         .hover(|s| s.text_color(theme::text()))
                                         .child("✕")
                                         .on_click(cx.listener(|state, _, _, cx| {
-                                            state.details = None;
+                                            state.overlay = Overlay::None;
                                             cx.notify();
                                         })),
                                 ),
@@ -1540,7 +1610,10 @@ impl IncusManager {
     }
 
     fn render_rename(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let (id, name) = self.rename.clone()?;
+        let Overlay::Rename { id, draft } = &self.overlay else {
+            return None;
+        };
+        let (id, name) = (id.clone(), draft.clone());
 
         Some(
             div()
@@ -1562,7 +1635,7 @@ impl IncusManager {
                             state.handle_rename_key(&event.keystroke, window, cx);
                         }))
                         .on_mouse_down_out(cx.listener(|state, _, window, cx| {
-                            state.rename = None;
+                            state.overlay = Overlay::None;
                             window.focus(&state.console_focus);
                             cx.notify();
                         }))
@@ -1610,17 +1683,12 @@ impl IncusManager {
 
     fn render_palette(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let matches = self.palette_matches();
-        let selected = self
-            .palette
-            .as_ref()
+        let palette = self.overlay.palette();
+        let selected = palette
             .and_then(|p| p.selected.as_ref())
             .and_then(|id| matches.iter().position(|vm| &vm.id == id))
             .unwrap_or(0);
-        let query = self
-            .palette
-            .as_ref()
-            .map(|p| p.query.clone())
-            .unwrap_or_default();
+        let query = palette.map(|p| p.query.clone()).unwrap_or_default();
 
         div()
             .absolute()
@@ -1734,7 +1802,7 @@ impl IncusManager {
             .on_mouse_down(
                 GpuiMouseButton::Left,
                 cx.listener(|state, _, _, cx| {
-                    state.remote_switcher_open = false;
+                    state.overlay = Overlay::None;
                     cx.notify();
                 }),
             )
@@ -1849,7 +1917,10 @@ impl IncusManager {
                             .hover(|s| s.text_color(theme::text()))
                             .child(format!("{} ▾", self.current_remote))
                             .on_click(cx.listener(|state, _, _, cx| {
-                                state.remote_switcher_open = !state.remote_switcher_open;
+                                state.overlay = match state.overlay {
+                                    Overlay::RemoteSwitcher => Overlay::None,
+                                    _ => Overlay::RemoteSwitcher,
+                                };
                                 cx.notify();
                             })),
                     )
@@ -2036,7 +2107,7 @@ impl IncusManager {
                                             )
                                         })
                                         .on_click(cx.listener(move |state, _, window, cx| {
-                                            state.context_menu = None;
+                                            state.overlay = Overlay::None;
                                             if running {
                                                 state.open_or_focus(id_open.clone(), window, cx);
                                             }
@@ -2044,9 +2115,11 @@ impl IncusManager {
                                         .on_mouse_down(
                                             GpuiMouseButton::Right,
                                             cx.listener(move |state, event: &gpui::MouseDownEvent, _, cx| {
-                                                state.context_menu =
-                                                    Some((id_menu.clone(), event.position));
-                                                state.power_menu_open = false;
+                                                state.overlay = Overlay::ContextMenu {
+                                                    id: id_menu.clone(),
+                                                    at: event.position,
+                                                    power_menu_open: false,
+                                                };
                                                 cx.notify();
                                             }),
                                         )
@@ -2560,11 +2633,13 @@ impl Render for IncusManager {
                     ),
             )
             .child(self.render_status_bar(cx))
-            .when(self.palette.is_some(), |el| el.child(self.render_palette(cx)))
+            .when(self.overlay.palette().is_some(), |el| {
+                el.child(self.render_palette(cx))
+            })
             .children(self.render_context_menu(window, cx))
             .children(self.render_details(cx))
             .children(self.render_rename(cx))
-            .when(self.remote_switcher_open, |el| {
+            .when(matches!(self.overlay, Overlay::RemoteSwitcher), |el| {
                 el.child(self.render_remote_switcher(cx))
             })
     }
@@ -2604,12 +2679,8 @@ fn main() {
                         held_capslock: false,
                         consumed_keys: std::collections::HashSet::new(),
                         collapsed_groups: Vec::new(),
-                        context_menu: None,
-                        power_menu_open: false,
-                        details: None,
-                        rename: None,
+                        overlay: Overlay::None,
                         rename_focus: cx.focus_handle(),
-                        palette: None,
                         palette_focus: cx.focus_handle(),
                         retired_frames: std::collections::VecDeque::new(),
                         render_seq: 0,
@@ -2623,7 +2694,6 @@ fn main() {
                             .map(Into::into)
                             .collect(),
                         current_remote: incus_remote::current_name().into(),
-                        remote_switcher_open: false,
                         remote_epoch: 0,
                         event_task: None,
                     };
