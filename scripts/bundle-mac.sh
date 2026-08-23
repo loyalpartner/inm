@@ -24,40 +24,49 @@ mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 cp target/release/inm "$APP_DIR/Contents/MacOS/inm"
 cp assets/mac/AppIcon.icns "$APP_DIR/Contents/Resources/AppIcon.icns"
 
-cat > "$APP_DIR/Contents/Info.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleName</key>
-    <string>$APP_NAME</string>
-    <key>CFBundleDisplayName</key>
-    <string>$APP_NAME</string>
-    <key>CFBundleIdentifier</key>
-    <string>$BUNDLE_ID</string>
-    <key>CFBundleVersion</key>
-    <string>$VERSION</string>
-    <key>CFBundleShortVersionString</key>
-    <string>$VERSION</string>
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-    <key>CFBundleExecutable</key>
-    <string>inm</string>
-    <key>CFBundleIconFile</key>
-    <string>AppIcon</string>
-    <key>CFBundleInfoDictionaryVersion</key>
-    <string>6.0</string>
-    <key>LSApplicationCategoryType</key>
-    <string>public.app-category.utilities</string>
-    <key>LSMinimumSystemVersion</key>
-    <string>11.0</string>
-    <key>NSHighResolutionCapable</key>
-    <true/>
-    <key>NSHumanReadableCopyright</key>
-    <string>inm</string>
-</dict>
-</plist>
-PLIST
+# Substituted from a template rather than written by a heredoc. A heredoc
+# is streamed through a pipe, and where the kernel hands out an undersized
+# pipe buffer — which happens on a long-lived macOS box whose pipe submap
+# has fragmented — bash blocks writing it and the script hangs after
+# "Assembling" with an empty Info.plist and no further output. `sed` writes
+# straight to the file. (Same fix, same reason, as canopy's bundler.)
+#
+# The template also earns its keep on its own: it can be linted, diffed,
+# and opened by plist tooling, which a 30-line string in a shell script
+# cannot.
+sed -e "s|@APP_NAME@|$APP_NAME|g" \
+    -e "s|@BUNDLE_ID@|$BUNDLE_ID|g" \
+    -e "s|@VERSION@|$VERSION|g" \
+    assets/mac/Info.plist.in > "$APP_DIR/Contents/Info.plist"
+
+# A malformed plist gives a bundle that silently refuses to launch, so it
+# fails here instead.
+plutil -lint "$APP_DIR/Contents/Info.plist" >/dev/null
+
+# Prove what was produced can actually run, rather than reporting success
+# because no step errored. inm has no CLI flag to invoke (main() just opens
+# a window), so check the two things that make a bundle assemble perfectly
+# and then refuse to open: the wrong architecture, and a dylib that is not
+# where the binary expects it. inm links Homebrew's spice-gtk by absolute
+# path, so an .app built here stops working the moment that keg moves.
+echo "==> Verifying"
+BIN="$APP_DIR/Contents/MacOS/inm"
+test -x "$BIN"
+if ! lipo -archs "$BIN" | tr ' ' '\n' | grep -qx "$(uname -m)"; then
+    echo "    !! $BIN 不含本机架构 $(uname -m)：$(lipo -archs "$BIN")" >&2
+    exit 1
+fi
+missing=0
+while read -r dylib; do
+    case "$dylib" in
+        /usr/lib/*|/System/*|@*) continue ;;
+    esac
+    if [ ! -e "$dylib" ]; then
+        echo "    !! 缺少依赖库：$dylib" >&2
+        missing=1
+    fi
+done < <(otool -L "$BIN" | tail -n +2 | awk '{print $1}')
+[ "$missing" -eq 0 ] || exit 1
 
 echo "==> Registering with Launch Services / Spotlight"
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP_DIR"
