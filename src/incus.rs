@@ -10,8 +10,8 @@
 use crate::incus_remote::{self, Connection};
 use gpui::SharedString;
 use http_body_util::{BodyExt, Empty, Full};
-use hyper::body::Bytes;
 use hyper::Request;
+use hyper::body::Bytes;
 use hyper_util::rt::TokioIo;
 use serde::Deserialize;
 use serde_json::Value;
@@ -24,10 +24,38 @@ pub struct VmId {
     pub name: SharedString,
 }
 
+/// An instance's run state, as the daemon reports it.
+///
+/// Worth a type rather than comparing `status` against `"Running"` at each
+/// call site: that test read every other state — including the two
+/// *transitional* ones — as "not running", so a machine mid-boot showed the
+/// same dead dot as a stopped one, with its ▶ button still offered.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    Running,
+    Stopped,
+    /// `Starting` or `Stopping`: on its way somewhere, and neither endpoint
+    /// is the truth yet.
+    Transitional,
+    /// `Frozen`, `Error`, or anything a future daemon adds.
+    Other,
+}
+
+impl Status {
+    fn parse(raw: &str) -> Self {
+        match raw {
+            "Running" => Status::Running,
+            "Stopped" => Status::Stopped,
+            "Starting" | "Stopping" => Status::Transitional,
+            _ => Status::Other,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Vm {
     pub id: VmId,
-    pub status: SharedString,
+    pub state: Status,
     /// Cluster member hosting this instance; empty when the daemon is not
     /// clustered. Shown in the sidebar so the fleet's layout is visible
     /// without opening each instance.
@@ -35,8 +63,15 @@ pub struct Vm {
 }
 
 impl Vm {
+    /// Whether the console can be opened and the stop/restart actions apply.
     pub fn running(&self) -> bool {
-        self.status.as_ref() == "Running"
+        self.state == Status::Running
+    }
+
+    /// Whether starting it is a thing the user can meaningfully ask for — false
+    /// while it is already on its way up or down.
+    pub fn startable(&self) -> bool {
+        matches!(self.state, Status::Stopped | Status::Other)
     }
 }
 
@@ -84,10 +119,17 @@ async fn request(method: &str, path: &str, body: Option<Value>) -> Result<Value,
         Some(v) => {
             builder = builder.header("Content-Type", "application/json");
             builder
-                .body(Full::new(Bytes::from(serde_json::to_vec(&v).map_err(|e| e.to_string())?)).boxed())
+                .body(
+                    Full::new(Bytes::from(
+                        serde_json::to_vec(&v).map_err(|e| e.to_string())?,
+                    ))
+                    .boxed(),
+                )
                 .map_err(|e| e.to_string())?
         }
-        None => builder.body(Empty::<Bytes>::new().boxed()).map_err(|e| e.to_string())?,
+        None => builder
+            .body(Empty::<Bytes>::new().boxed())
+            .map_err(|e| e.to_string())?,
     };
 
     let resp = sender.send_request(req).await.map_err(|e| e.to_string())?;
@@ -140,16 +182,21 @@ async fn wait_operation(id: &str) -> Result<(), String> {
         let meta = &envelope["metadata"];
         // Fall back to the textual status for a daemon old enough not to send
         // `status_code`, so this cannot regress into an infinite wait there.
-        let code = meta["status_code"].as_u64().unwrap_or(match meta["status"].as_str() {
-            Some("Success") => OP_SUCCESS,
-            Some("Failure") | Some("Cancelled") => OP_SUCCESS + 1,
-            _ => 0,
-        });
+        let code = meta["status_code"]
+            .as_u64()
+            .unwrap_or(match meta["status"].as_str() {
+                Some("Success") => OP_SUCCESS,
+                Some("Failure") | Some("Cancelled") => OP_SUCCESS + 1,
+                _ => 0,
+            });
         if code == OP_SUCCESS {
             return Ok(());
         }
         if code > OP_SUCCESS {
-            let detail = meta["err"].as_str().filter(|e| !e.is_empty()).unwrap_or("操作失败");
+            let detail = meta["err"]
+                .as_str()
+                .filter(|e| !e.is_empty())
+                .unwrap_or("操作失败");
             return Err(detail.to_string());
         }
         // Still running — go round again.
@@ -171,7 +218,7 @@ pub async fn list_vms() -> Result<Vec<Vm>, String> {
                 project: v.project.into(),
                 name: v.name.into(),
             },
-            status: v.status.into(),
+            state: Status::parse(&v.status),
             location: v.location.into(),
         })
         .collect();
@@ -378,7 +425,10 @@ pub async fn open_console(id: &VmId, force: bool) -> Result<ConsoleOperation, St
         .ok_or("响应中缺少 operation id")?
         .to_string();
     let fds = &envelope["metadata"]["metadata"]["fds"];
-    let data_secret = fds["0"].as_str().ok_or("响应中缺少 SPICE 数据通道")?.to_string();
+    let data_secret = fds["0"]
+        .as_str()
+        .ok_or("响应中缺少 SPICE 数据通道")?
+        .to_string();
     let control_secret = fds["control"]
         .as_str()
         .ok_or("响应中缺少控制通道")?
@@ -420,7 +470,9 @@ pub async fn events_websocket() -> Result<tokio_tungstenite::WebSocketStream<Con
     connect_ws("/1.0/events?type=lifecycle&all-projects=true").await
 }
 
-async fn connect_ws(path_and_query: &str) -> Result<tokio_tungstenite::WebSocketStream<Connection>, String> {
+async fn connect_ws(
+    path_and_query: &str,
+) -> Result<tokio_tungstenite::WebSocketStream<Connection>, String> {
     let remote = incus_remote::current()?;
     let conn = incus_remote::connect(&remote).await?;
 
@@ -514,7 +566,12 @@ fn parse_instance_event(text: &str) -> Option<InstanceEvent> {
     // Daemons carrying the `event_lifecycle_name_and_project` extension put
     // both directly in the metadata; prefer those over picking the `source`
     // URL apart, and keep the parsing only as the fallback for older ones.
-    let named = |key: &str| metadata[key].as_str().filter(|v| !v.is_empty()).map(str::to_string);
+    let named = |key: &str| {
+        metadata[key]
+            .as_str()
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
     let (name, project) = match (named("name"), named("project")) {
         (Some(name), Some(project)) => (name, project),
         _ => parse_instance_source(metadata["source"].as_str()?)?,
@@ -566,6 +623,50 @@ mod tests {
 
     fn lifecycle(metadata: serde_json::Value) -> String {
         serde_json::json!({ "type": "lifecycle", "metadata": metadata }).to_string()
+    }
+
+    #[test]
+    fn transitional_states_are_neither_running_nor_startable() {
+        let vm = |raw: &str| Vm {
+            id: VmId {
+                project: "p".into(),
+                name: "n".into(),
+            },
+            state: Status::parse(raw),
+            location: "".into(),
+        };
+        // Mid-boot must not read as "off": it used to show the stopped dot
+        // and still offer ▶.
+        assert!(!vm("Starting").running());
+        assert!(!vm("Starting").startable());
+        assert!(!vm("Stopping").running());
+        assert!(!vm("Stopping").startable());
+
+        assert!(vm("Running").running());
+        assert!(!vm("Running").startable());
+        assert!(!vm("Stopped").running());
+        assert!(vm("Stopped").startable());
+    }
+
+    #[test]
+    fn an_unknown_state_stays_startable_rather_than_unusable() {
+        // Frozen/Error, or whatever a future daemon adds: better to offer the
+        // action and let the daemon refuse than to lock the row.
+        assert!(!vm_state("Frozen").0);
+        assert!(vm_state("Frozen").1);
+        assert!(vm_state("Weird").1);
+    }
+
+    fn vm_state(raw: &str) -> (bool, bool) {
+        let vm = Vm {
+            id: VmId {
+                project: "p".into(),
+                name: "n".into(),
+            },
+            state: Status::parse(raw),
+            location: "".into(),
+        };
+        (vm.running(), vm.startable())
     }
 
     #[test]
@@ -627,16 +728,21 @@ mod tests {
 
     #[test]
     fn non_instance_and_non_lifecycle_traffic_is_ignored() {
-        assert!(parse_instance_event(&lifecycle(serde_json::json!({
-            "action": "network-created",
-            "source": "/1.0/networks/br0",
-        })))
-        .is_none());
+        assert!(
+            parse_instance_event(&lifecycle(serde_json::json!({
+                "action": "network-created",
+                "source": "/1.0/networks/br0",
+            })))
+            .is_none()
+        );
 
-        assert!(parse_instance_event(
-            &serde_json::json!({ "type": "logging", "metadata": { "message": "hi" } }).to_string()
-        )
-        .is_none());
+        assert!(
+            parse_instance_event(
+                &serde_json::json!({ "type": "logging", "metadata": { "message": "hi" } })
+                    .to_string()
+            )
+            .is_none()
+        );
 
         assert!(parse_instance_event("not json at all").is_none());
     }

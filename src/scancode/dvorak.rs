@@ -2,7 +2,10 @@
 //! back to the QWERTY physical key position that produced them.
 
 fn probe(program: &str, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new(program).args(args).output().ok()?;
+    let out = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .ok()?;
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
@@ -66,6 +69,10 @@ fn active_group_is_dvorak(query: &str) -> bool {
 
 /// Reported character -> the QWERTY key position that produced it on a US
 /// Dvorak layout. Digits and unlisted keys share their QWERTY position.
+// Kept hand-aligned: rustfmt would put each arm on its own line and the
+// row-by-row correspondence to a physical keyboard — the whole point of
+// reading this as a table — would be lost.
+#[rustfmt::skip]
 pub(super) fn dvorak_to_physical(key: &str) -> &str {
     match key {
         // Top letter row (QWERTY q..\)
@@ -103,14 +110,16 @@ mod tests {
 
     #[test]
     fn setxkbmap_dvorak_as_the_first_variant() {
-        let query = "rules:      evdev\nmodel:      pc105\nlayout:     us,us\nvariant:    dvorak,\n";
+        let query =
+            "rules:      evdev\nmodel:      pc105\nlayout:     us,us\nvariant:    dvorak,\n";
         assert!(active_group_is_dvorak(query));
     }
 
     #[test]
     fn setxkbmap_dvorak_only_as_the_secondary_group() {
         // The layout the guest VMs use: US first, Dvorak as an alternative.
-        let query = "rules:      evdev\nmodel:      pc105\nlayout:     us,us\nvariant:    ,dvorak\n";
+        let query =
+            "rules:      evdev\nmodel:      pc105\nlayout:     us,us\nvariant:    ,dvorak\n";
         assert!(!active_group_is_dvorak(query));
     }
 
@@ -121,7 +130,8 @@ mod tests {
 
     #[test]
     fn localectl_shape() {
-        let status = "   System Locale: LANG=en_US.UTF-8\n       VC Keymap: n/a\n      X11 Layout: dvorak\n";
+        let status =
+            "   System Locale: LANG=en_US.UTF-8\n       VC Keymap: n/a\n      X11 Layout: dvorak\n";
         assert!(active_group_is_dvorak(status));
     }
 

@@ -106,12 +106,18 @@ fn resolve(name: &str) -> Result<Arc<Remote>, String> {
         return Ok(remote.clone());
     }
     let remote = Arc::new(resolve_named(name)?);
-    cache().lock().unwrap().resolved.insert(name.to_string(), remote.clone());
+    cache()
+        .lock()
+        .unwrap()
+        .resolved
+        .insert(name.to_string(), remote.clone());
     Ok(remote)
 }
 
 fn default_remote_name() -> Result<String, String> {
-    Ok(load_config()?.default_remote.unwrap_or_else(|| "local".to_string()))
+    Ok(load_config()?
+        .default_remote
+        .unwrap_or_else(|| "local".to_string()))
 }
 
 fn load_config() -> Result<RawConfig, String> {
@@ -158,7 +164,9 @@ fn resolve_named(remote_name: &str) -> Result<Remote, String> {
 
     let client_cert = load_certs(&config_dir.join("client.crt"))?;
     let client_key = load_key(&config_dir.join("client.key"))?;
-    let pinned_cert_path = config_dir.join("servercerts").join(format!("{remote_name}.crt"));
+    let pinned_cert_path = config_dir
+        .join("servercerts")
+        .join(format!("{remote_name}.crt"));
     let pinned_cert = load_certs(&pinned_cert_path)
         .map_err(|_| {
             format!(
@@ -234,13 +242,15 @@ fn local_socket_path() -> PathBuf {
     if let Ok(p) = std::env::var("INCUS_SOCKET") {
         return PathBuf::from(p);
     }
-    let dir = std::env::var("INCUS_DIR").map(PathBuf::from).unwrap_or_else(|_| {
-        if Path::new("/run/incus/unix.socket").exists() {
-            PathBuf::from("/run/incus")
-        } else {
-            PathBuf::from("/var/lib/incus")
-        }
-    });
+    let dir = std::env::var("INCUS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            if Path::new("/run/incus/unix.socket").exists() {
+                PathBuf::from("/run/incus")
+            } else {
+                PathBuf::from("/var/lib/incus")
+            }
+        });
     dir.join("unix.socket")
 }
 
@@ -283,7 +293,8 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
             Ok(rustls::client::danger::ServerCertVerified::assertion())
         } else {
             Err(rustls::Error::General(
-                "服务器证书与本地保存的证书不匹配，可能被重新生成过；请重新 `incus remote add`".into(),
+                "服务器证书与本地保存的证书不匹配，可能被重新生成过；请重新 `incus remote add`"
+                    .into(),
             ))
         }
     }
@@ -325,7 +336,11 @@ pub async fn connect(remote: &Remote) -> Result<Connection, String> {
             .await
             .map(Connection::Unix)
             .map_err(|e| format!("无法连接 {}: {e}", path.display())),
-        Remote::Tls { host, port, tls_config } => {
+        Remote::Tls {
+            host,
+            port,
+            tls_config,
+        } => {
             // A firewall that silently drops SYN packets (a common default
             // posture) would otherwise hang this for the OS's default TCP
             // connect timeout — commonly a minute or more — with the UI
@@ -337,8 +352,8 @@ pub async fn connect(remote: &Remote) -> Result<Connection, String> {
             .await
             .map_err(|_| format!("连接 {host}:{port} 超时"))?
             .map_err(|e| format!("无法连接 {host}:{port}: {e}"))?;
-            let server_name = ServerName::try_from(host.clone())
-                .map_err(|_| format!("无效的主机名: {host}"))?;
+            let server_name =
+                ServerName::try_from(host.clone()).map_err(|_| format!("无效的主机名: {host}"))?;
             let tls = tokio_rustls::TlsConnector::from(tls_config.clone())
                 .connect(server_name, tcp)
                 .await
@@ -349,7 +364,11 @@ pub async fn connect(remote: &Remote) -> Result<Connection, String> {
 }
 
 impl AsyncRead for Connection {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         match self.get_mut() {
             Connection::Unix(s) => Pin::new(s).poll_read(cx, buf),
             Connection::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
@@ -358,7 +377,11 @@ impl AsyncRead for Connection {
 }
 
 impl AsyncWrite for Connection {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         match self.get_mut() {
             Connection::Unix(s) => Pin::new(s).poll_write(cx, buf),
             Connection::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),

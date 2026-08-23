@@ -107,8 +107,14 @@ mod tests {
         // A bare numpad press (no real Shift held) must use the numpad's own
         // dedicated scancode, not the main-row Shift-=/Shift-8 one — sending
         // that would need a Shift the guest never sees held.
-        assert_eq!(scancode_for_host("+", HostLayout::Qwerty, false), Some(0x4E));
-        assert_eq!(scancode_for_host("*", HostLayout::Qwerty, false), Some(0x37));
+        assert_eq!(
+            scancode_for_host("+", HostLayout::Qwerty, false),
+            Some(0x4E)
+        );
+        assert_eq!(
+            scancode_for_host("*", HostLayout::Qwerty, false),
+            Some(0x37)
+        );
         // A real Shift-=/Shift-8 combo keeps resolving to the shifted table.
         assert_eq!(
             scancode_for_host("+", HostLayout::Qwerty, true),

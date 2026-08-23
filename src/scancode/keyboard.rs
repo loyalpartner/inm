@@ -14,6 +14,9 @@ pub(super) const KP_PLUS: u32 = 0x4E;
 /// Numpad `*`.
 pub(super) const KP_ASTERISK: u32 = 0x37;
 
+// Hand-aligned for the same reason as `dvorak_to_physical`: these rows mirror
+// the physical keyboard, and one arm per line would hide that.
+#[rustfmt::skip]
 pub fn scancode_for(key: &str) -> Option<u32> {
     let code = match key {
         // Letters
