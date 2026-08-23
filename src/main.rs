@@ -49,6 +49,10 @@ const EVENT_RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// the next reconnect starts from the short delay again.
 const EVENT_HEALTHY_AFTER: Duration = Duration::from_secs(60);
 
+/// What a context-menu row does when clicked. Boxed because each row closes
+/// over a different instance and action.
+type MenuAction<T> = Box<dyn Fn(&mut T, &mut Window, &mut Context<T>)>;
+
 /// What the event-stream reader hands the UI.
 enum ListChange {
     /// One instance changed.
@@ -510,10 +514,10 @@ impl IncusManager {
                 }
             }
             _ => {
-                if let Some(ch) = keystroke.key_char.as_ref() {
-                    if ch.chars().all(|c| !c.is_control()) {
-                        name.push_str(ch);
-                    }
+                if let Some(ch) = keystroke.key_char.as_ref()
+                    && ch.chars().all(|c| !c.is_control())
+                {
+                    name.push_str(ch);
                 }
             }
         }
@@ -1157,11 +1161,11 @@ impl IncusManager {
                 return;
             }
             _ => {
-                if let Some(ch) = keystroke.key_char.as_ref() {
-                    if ch.chars().all(|c| !c.is_control()) {
-                        palette.query.push_str(ch);
-                        palette.selected = None;
-                    }
+                if let Some(ch) = keystroke.key_char.as_ref()
+                    && ch.chars().all(|c| !c.is_control())
+                {
+                    palette.query.push_str(ch);
+                    palette.selected = None;
                 }
             }
         }
@@ -1185,7 +1189,7 @@ impl IncusManager {
                     key: &'static str,
                     enabled: bool,
                     closes_power_menu: bool,
-                    action: Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)>| {
+                    action: MenuAction<Self>| {
             div()
                 .id(SharedString::from(format!("menu-{key}")))
                 .px_3()
@@ -1782,10 +1786,10 @@ impl IncusManager {
             }
             "escape" => self.filter.clear(),
             _ => {
-                if let Some(ch) = keystroke.key_char.as_ref() {
-                    if ch.chars().all(|c| !c.is_control()) {
-                        self.filter.push_str(ch);
-                    }
+                if let Some(ch) = keystroke.key_char.as_ref()
+                    && ch.chars().all(|c| !c.is_control())
+                {
+                    self.filter.push_str(ch);
                 }
             }
         }
@@ -1907,9 +1911,9 @@ impl IncusManager {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .children(self.grouped.iter().cloned().map(|(project, vms)| {
+                    .children(self.grouped.iter().map(|(project, vms)| {
                         // A search implicitly expands, otherwise hits stay hidden.
-                        let collapsed = !filtering && self.collapsed.contains(&project);
+                        let collapsed = !filtering && self.collapsed.contains(project);
                         let project_for_click = project.clone();
 
                         div()
@@ -1953,7 +1957,7 @@ impl IncusManager {
                                     })),
                             )
                             .when(!collapsed, |el| {
-                                el.children(vms.into_iter().map(|vm| {
+                                el.children(vms.iter().map(|vm| {
                                     let is_active = self.active.as_ref() == Some(&vm.id);
                                     let is_open = self.is_open(&vm.id);
                                     let pending = self.connecting.contains(&vm.id);
@@ -1975,7 +1979,7 @@ impl IncusManager {
                                         .cursor_pointer()
                                         .when(is_active, |s| s.bg(theme::selected()))
                                         .hover(|s| s.bg(theme::hover()))
-                            .child(status_dot(running))
+                                        .child(status_dot(running))
                                         .child(
                                             div()
                                                 .flex_1()

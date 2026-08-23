@@ -455,15 +455,14 @@ fn build_session(req: SessionRequest) -> Result<(), String> {
             if in_flight.load(Ordering::Relaxed) {
                 return glib::ControlFlow::Continue;
             }
-            if dirty.replace(false) {
-                if let Some(display) = display_channel.borrow().as_ref() {
-                    if let Some(image) = primary_to_image(display) {
-                        in_flight.store(true, Ordering::Relaxed);
-                        if frames.unbounded_send(image).is_err() {
-                            alive.set(false);
-                            return glib::ControlFlow::Break;
-                        }
-                    }
+            if dirty.replace(false)
+                && let Some(display) = display_channel.borrow().as_ref()
+                && let Some(image) = primary_to_image(display)
+            {
+                in_flight.store(true, Ordering::Relaxed);
+                if frames.unbounded_send(image).is_err() {
+                    alive.set(false);
+                    return glib::ControlFlow::Break;
                 }
             }
             glib::ControlFlow::Continue

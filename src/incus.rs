@@ -239,10 +239,10 @@ pub async fn details(id: &VmId) -> Result<VmDetails, String> {
                     continue;
                 }
                 for addr in value["addresses"].as_array().into_iter().flatten() {
-                    if addr["family"].as_str() == Some("inet") {
-                        if let Some(ip) = addr["address"].as_str() {
-                            addresses.push((iface.clone(), ip.to_string()));
-                        }
+                    if addr["family"].as_str() == Some("inet")
+                        && let Some(ip) = addr["address"].as_str()
+                    {
+                        addresses.push((iface.clone(), ip.to_string()));
                     }
                 }
             }
