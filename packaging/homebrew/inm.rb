@@ -7,13 +7,13 @@
 # noticed, meaning `brew install` was shipping code two versions old.
 #
 # The sha256 is of the tag's GitHub-generated source tarball. Verified for
-# v0.3.1 against both a fresh download and the checksum release.yml computed
+# v0.3.2 against both a fresh download and the checksum release.yml computed
 # for the AUR package from the same tarball.
 class Inm < Formula
   desc "Native manager for Incus virtual machines with the SPICE console embedded"
   homepage "https://github.com/loyalpartner/inm"
-  url "https://github.com/loyalpartner/inm/archive/refs/tags/v0.3.1.tar.gz"
-  sha256 "cc1ee60df2ba154688473eeade4665a4d1960a9087e26763de7bfc768eba615a"
+  url "https://github.com/loyalpartner/inm/archive/refs/tags/v0.3.2.tar.gz"
+  sha256 "ba9e246e5c37d683187385a15943fa37b0f8d8275359997f1dac9f048b347511"
   license "MIT"
 
   depends_on "pkg-config" => :build
