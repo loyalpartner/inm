@@ -5,7 +5,15 @@ on:
     tags: ["v*"]
 
 jobs:
+  # A tag used to go straight to a published release and an AUR push without
+  # the code ever being built or tested. Gate both on the same checks CI runs
+  # on master, so a broken tag fails here instead of on every Arch user's
+  # machine.
+  verify:
+    uses: ./.github/workflows/ci.yml
+
   create-release:
+    needs: verify
     runs-on: ubuntu-latest
     permissions:
       contents: write
