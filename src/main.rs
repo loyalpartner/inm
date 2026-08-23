@@ -837,7 +837,6 @@ impl IncusManager {
                         let id = id.clone();
                         let still_open = this
                             .update(cx, |state, cx| {
-                                let is_active = state.active.as_ref() == Some(&id);
                                 let Some(tab) = state.tabs.iter_mut().find(|t| t.id == id) else {
                                     return false;
                                 };
@@ -849,14 +848,20 @@ impl IncusManager {
                                 if let Some(previous) = previous {
                                     state.retire_frame(previous);
                                 }
-                                // Only the visible tab repaints. What keeps a
-                                // background tab warm is its SPICE connection
-                                // staying up, not continued decoding —
-                                // `set_visible(false)` stops it converting
-                                // frames at all (see `ConsoleHandle`).
-                                if is_active {
-                                    cx.notify();
-                                }
+                                // Unconditionally, even for a tab that is not on
+                                // screen. This used to be guarded on the tab
+                                // being active, to keep a background tab from
+                                // forcing repaints — but a background tab does
+                                // not produce frames in the first place
+                                // (`set_visible(false)` stops the conversion),
+                                // so the guard bought nothing and cost a lost
+                                // wakeup: `frame_in_flight` is cleared *only* by
+                                // `render`, `render` runs only on a notify, and
+                                // a frame that arrived without one left the flag
+                                // stuck, so the producer never built another.
+                                // That is the black console that came back the
+                                // moment you switched tabs.
+                                cx.notify();
                                 true
                             })
                             .unwrap_or(false);
