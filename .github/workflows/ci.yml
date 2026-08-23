@@ -24,7 +24,7 @@ jobs:
         # ships to real users, so both gate a release.
         os: [macos-latest, ubuntu-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install spice-gtk (macOS)
         if: runner.os == 'macOS'
