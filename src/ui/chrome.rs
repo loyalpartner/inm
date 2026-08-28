@@ -561,7 +561,16 @@ impl IncusManager {
                                     state.send_ctrl_alt_del();
                                 })),
                         )
-                    }),
+                    })
+                    // Last, so the version sits in the corner and the
+                    // variable-length messages grow to its left instead of
+                    // pushing it around.
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::faint())
+                            .child(concat!("v", env!("CARGO_PKG_VERSION"))),
+                    ),
             )
     }
 }
