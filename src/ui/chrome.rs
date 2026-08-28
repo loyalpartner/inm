@@ -376,17 +376,31 @@ impl IncusManager {
                             .text_color(theme::faint())
                             .hover(|s| s.text_color(theme::danger()))
                             .child("✕")
+                            // Swallow the press, not just the click. A click
+                            // is armed on mouse-down and fired on mouse-up, so
+                            // stopping propagation in the click handler alone
+                            // relies on the row's own click losing that race —
+                            // which it did on macOS but not on Linux, where
+                            // closing a tab immediately reconnected the
+                            // console. Eating the mouse-down means the row
+                            // never arms, whatever the platform does with the
+                            // mouse-up.
+                            .on_mouse_down(GpuiMouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
                             .on_click(cx.listener(move |state, _, _, cx| {
-                                // Without this the click also lands on the
-                                // row's own on_click below, which just
-                                // reopened the tab we were closing.
                                 cx.stop_propagation();
                                 state.close_tab(&id_close);
                                 cx.notify();
                             })),
                     )
                     .on_click(cx.listener(move |state, _, window, cx| {
-                        state.open_or_focus(id_focus.clone(), window, cx);
+                        // Deliberately not `open_or_focus`: a tab row exists
+                        // only for a tab that is already connected, so
+                        // clicking one must never be able to *start* a
+                        // console — that is what turned a stray click into a
+                        // reconnect of the tab being closed.
+                        state.focus_tab(&id_focus, window, cx);
                     }))
                     .into_any_element(),
             );

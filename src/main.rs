@@ -764,6 +764,22 @@ impl IncusManager {
         }
     }
 
+    /// Bring an already-open tab to the front.
+    ///
+    /// Unlike `open_or_focus` this can never connect anything: the tab bar
+    /// only ever draws tabs that exist, so a click on one that has since been
+    /// closed (the close button and the row itself sit on the same pixel) must
+    /// do nothing rather than reopen the console.
+    fn focus_tab(&mut self, id: &VmId, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.is_open(id) {
+            return;
+        }
+        self.clear_errors();
+        window.focus(&self.console_focus);
+        self.set_active(Some(id.clone()));
+        cx.notify();
+    }
+
     /// Open `id` in a tab, or just switch to it when it is already connected.
     fn open_or_focus(&mut self, id: VmId, window: &mut Window, cx: &mut Context<Self>) {
         self.clear_errors();
