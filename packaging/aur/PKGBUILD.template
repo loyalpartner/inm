@@ -12,7 +12,10 @@
 
 pkgname=inm
 pkgver=@VERSION@
-pkgrel=2
+# Resets to 1 with every new pkgver, which is every time this template is
+# rendered — it only ever moves when the same pkgver is repackaged, and that
+# is not something release.yml can do.
+pkgrel=1
 pkgdesc="Native manager for Incus virtual machines with the SPICE console embedded in the app"
 arch=('x86_64')
 url="https://github.com/loyalpartner/inm"
